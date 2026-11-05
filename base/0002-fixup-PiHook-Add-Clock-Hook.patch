@@ -1,0 +1,35 @@
+From 4fb8b139b89905482cc09e0ad7f9d43b9048298e Mon Sep 17 00:00:00 2001
+From: fisholy <linotfish@outlook.com>
+Date: Tue, 4 Aug 2026 20:22:33 +0800
+Subject: [PATCH 2/4] fixup!:PiHook: Add Clock Hook
+
+Change-Id: I7db978d4c4ea431f0b5e8657fd1064138aedfad7
+---
+ core/java/com/android/internal/util/PropImitationHooks.java | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/core/java/com/android/internal/util/PropImitationHooks.java b/core/java/com/android/internal/util/PropImitationHooks.java
+index c8409c949..3be33c51e 100644
+--- a/core/java/com/android/internal/util/PropImitationHooks.java
++++ b/core/java/com/android/internal/util/PropImitationHooks.java
+@@ -92,7 +92,7 @@ public class PropImitationHooks {
+         "FINGERPRINT", "google/sailfish/sailfish:10/QP1A.191005.007.A3/5972272:user/release-keys"
+     );
+ 
+-    private static final Map<string,string> sPixelTenProps = Map.of(
++    private static final Map<String,String> sPixelTenProps = Map.of(
+         "PRODUCT", "mustang",
+         "DEVICE", "mustang",
+         "MANUFACTURER", "Google",
+@@ -132,7 +132,7 @@ public class PropImitationHooks {
+     private static volatile String sStockFp, sNetflixModel;
+ 
+     private static volatile String sProcessName;
+-    private static volatile boolean sIsGms, sIsFinsky, sIsPhotos;
++    private static volatile boolean sIsGms, sIsFinsky, sIsPhotos, sIsDeskClock;
+ 
+     private static final Field OFFSET_FIELD;
+     private static final Unsafe UNSAFE;
+-- 
+2.53.0
+

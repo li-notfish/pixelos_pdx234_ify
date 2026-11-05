@@ -1,0 +1,890 @@
+From d5380a4456ebee0c5596b35c1b4cf0974a646c24 Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Thu, 29 Oct 2026 20:09:10 +0800
+Subject: [PATCH 4/4] GameMode: add a user maintained list of game packages
+
+Automatic game detection only looks at ApplicationInfo.category, so
+sideloaded games, emulators and anything that never declared
+android:appCategory are treated as regular apps. That kills the game
+power hint, the game mode APIs and anything built on top of them.
+
+Add a user maintained list, stored in Settings.Secure and exposed through
+GameModeController:
+
+  game_mode_packages          games the user picked
+  game_mode_suppress_heads_up subset that should not pop up while playing
+  game_mode_mute              subset that should stay silent while playing
+
+GameManagerService.isPackageGame() and GameClassifierImpl consult that
+list first and also accept the legacy FLAG_IS_GAME. The lists are comma
+separated, so they stay editable from adb:
+
+  settings put secure game_mode_packages "com.foo,com.bar"
+
+Games are now also offered the system PERFORMANCE and BATTERY modes even
+when they never declared a game-mode-config. The bitfield no longer hides
+those two behind the manifest opt-in, which only ever described whether
+the game handles the mode itself, and battery falls back to a 0.7x render
+scaling. Games that did opt in are still left alone.
+
+Notifications honor the two flags: NotificationManagerService skips sound
+and vibration, SystemUI suppresses the heads-up. Both need the foreground
+package, and asking ActivityTaskManagerInternal for it while the
+notification lock is held would take the window manager global lock
+there, so a TaskStackListener caches it instead and the read becomes a
+volatile field access. Only fullscreen tasks count, split screen and
+freeform keep the normal behaviour.
+
+Finally, a per game ANGLE selection writes the existing
+angle_gl_driver_selection_pkgs/_values lists that GraphicsEnvironment
+reads when a process starts.
+
+Change-Id: Id12b1364a102511e721f76164f83986c04666b4a
+---
+ core/java/android/provider/Settings.java      |  21 ++
+ .../internal/util/GameModeController.java     | 285 ++++++++++++++++++
+ .../CommonVisualInterruptionSuppressors.kt    |  26 ++
+ .../interruption/GameModeForegroundTracker.kt |  69 +++++
+ .../VisualInterruptionDecisionProviderImpl.kt |   1 +
+ .../server/app/GameClassifierImpl.java        |  31 +-
+ .../server/app/GameManagerService.java        |  61 +++-
+ ...ameServiceProviderInstanceFactoryImpl.java |  10 +-
+ .../GameModeForegroundTracker.java            |  88 ++++++
+ .../NotificationAttentionHelper.java          |  12 +
+ 10 files changed, 580 insertions(+), 24 deletions(-)
+ create mode 100644 core/java/com/android/internal/util/GameModeController.java
+ create mode 100644 packages/SystemUI/src/com/android/systemui/statusbar/notification/interruption/GameModeForegroundTracker.kt
+ create mode 100644 services/core/java/com/android/server/notification/GameModeForegroundTracker.java
+
+diff --git a/core/java/android/provider/Settings.java b/core/java/android/provider/Settings.java
+index 8abd07a20..0b3ed3d6b 100644
+--- a/core/java/android/provider/Settings.java
++++ b/core/java/android/provider/Settings.java
+@@ -7671,6 +7671,27 @@ public final class Settings {
+         // NOTE: If you add new settings here, be sure to add them to
+         // com.android.providers.settings.SettingsProtoDumpUtil#dumpProtoSecureSettingsLocked.
+ 
++        /**
++         * Comma separated list of packages the user marked as games.
++         * Kept in sync with the game mode settings screen.
++         * @hide
++         */
++        public static final String GAME_MODE_PACKAGES = "game_mode_packages";
++
++        /**
++         * Comma separated subset of {@link #GAME_MODE_PACKAGES} whose notifications
++         * must not pop up as heads-up while the game is in the foreground.
++         * @hide
++         */
++        public static final String GAME_MODE_SUPPRESS_HEADS_UP = "game_mode_suppress_heads_up";
++
++        /**
++         * Comma separated subset of {@link #GAME_MODE_PACKAGES} whose notifications
++         * must stay silent (no sound, no vibration) while the game is in the foreground.
++         * @hide
++         */
++        public static final String GAME_MODE_MUTE = "game_mode_mute";
++
+         /**
+          * The content:// style URL for this table
+          */
+diff --git a/core/java/com/android/internal/util/GameModeController.java b/core/java/com/android/internal/util/GameModeController.java
+new file mode 100644
+index 000000000..6eef5179e
+--- /dev/null
++++ b/core/java/com/android/internal/util/GameModeController.java
+@@ -0,0 +1,285 @@
++/**
++ * Copyright (C) 2026 The PixelOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.internal.util;
++
++import android.content.Context;
++import android.database.ContentObserver;
++import android.os.Handler;
++import android.os.Looper;
++import android.os.UserHandle;
++import android.provider.Settings;
++import android.text.TextUtils;
++import android.util.Log;
++
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++/**
++ * Keeps the user maintained list of game packages, plus the per game notification
++ * preferences, in sync with {@link Settings.Secure}.
++ *
++ * <p>The lists are stored as comma separated package names so that they can be
++ * maintained from adb:
++ * <pre>
++ *   settings put secure game_mode_packages "com.foo,com.bar"
++ *   settings put secure game_mode_suppress_heads_up "com.foo"
++ *   settings put secure game_mode_mute "com.foo,com.bar"
++ * </pre>
++ */
++public class GameModeController {
++
++    private static final String TAG = "GameModeController";
++
++    private final Context mContext;
++    private final SettingsObserver mObserver;
++
++    // Settings may not be readable yet when a system service constructs us during boot,
++    // so the initial load is retried lazily instead of throwing.
++    private volatile boolean mLoaded;
++
++    private Set<String> mGames = new HashSet<>();
++    private Set<String> mSuppressHeadsUp = new HashSet<>();
++    private Set<String> mMute = new HashSet<>();
++
++    public GameModeController(Context context) {
++        mContext = context;
++        mObserver = new SettingsObserver(new Handler(Looper.getMainLooper()));
++        mObserver.observe();
++    }
++
++    public void destroy() {
++        mContext.getContentResolver().unregisterContentObserver(mObserver);
++    }
++
++    private void ensureLoaded() {
++        if (!mLoaded) {
++            mObserver.update();
++        }
++    }
++
++    public boolean isGame(String packageName) {
++        ensureLoaded();
++        return packageName != null && mGames.contains(packageName);
++    }
++
++    public boolean shouldSuppressHeadsUp(String packageName) {
++        ensureLoaded();
++        return packageName != null && mSuppressHeadsUp.contains(packageName);
++    }
++
++    public boolean shouldMute(String packageName) {
++        ensureLoaded();
++        return packageName != null && mMute.contains(packageName);
++    }
++
++    /** Cheap guard so callers can skip resolving the foreground app when nothing is muted. */
++    public boolean hasMutedGames() {
++        ensureLoaded();
++        return !mMute.isEmpty();
++    }
++
++    /** Cheap guard so callers can skip resolving the foreground app when nothing is suppressed. */
++    public boolean hasSuppressedGames() {
++        ensureLoaded();
++        return !mSuppressHeadsUp.isEmpty();
++    }
++
++    // ANGLE selections live in Settings.Global because that is what GraphicsEnvironment reads
++    // when a process starts. Two parallel comma separated lists, package and driver.
++
++    private static final String ANGLE_DRIVER = "angle";
++
++    /** @return true when this package is explicitly pinned to the ANGLE GL driver. */
++    public boolean shouldUseAngle(String packageName) {
++        if (TextUtils.isEmpty(packageName)) {
++            return false;
++        }
++        return ANGLE_DRIVER.equals(readAngleSelections().get(packageName));
++    }
++
++    /**
++     * Pins the package to the ANGLE GL driver, or drops our entry again. Entries the user set
++     * through Developer options are preserved either way.
++     *
++     * <p>GraphicsEnvironment reads the selection when a process starts, so the app has to be
++     * restarted before the change takes effect.
++     */
++    public void setUseAngle(String packageName, boolean enabled) {
++        if (TextUtils.isEmpty(packageName)) {
++            return;
++        }
++        final Map<String, String> selections = readAngleSelections();
++        final boolean pinnedToAngle = ANGLE_DRIVER.equals(selections.get(packageName));
++        if (enabled == pinnedToAngle) {
++            return;
++        }
++        if (enabled) {
++            selections.put(packageName, ANGLE_DRIVER);
++        } else {
++            selections.remove(packageName);
++        }
++        Settings.Global.putString(mContext.getContentResolver(),
++                Settings.Global.ANGLE_GL_DRIVER_SELECTION_PKGS,
++                TextUtils.join(",", selections.keySet()));
++        Settings.Global.putString(mContext.getContentResolver(),
++                Settings.Global.ANGLE_GL_DRIVER_SELECTION_VALUES,
++                TextUtils.join(",", selections.values()));
++    }
++
++    private Map<String, String> readAngleSelections() {
++        final List<String> packages = split(
++                Settings.Global.getString(mContext.getContentResolver(),
++                        Settings.Global.ANGLE_GL_DRIVER_SELECTION_PKGS));
++        final List<String> drivers = split(
++                Settings.Global.getString(mContext.getContentResolver(),
++                        Settings.Global.ANGLE_GL_DRIVER_SELECTION_VALUES));
++        final Map<String, String> selections = new LinkedHashMap<>();
++        final int count = Math.min(packages.size(), drivers.size());
++        for (int i = 0; i < count; i++) {
++            selections.put(packages.get(i), drivers.get(i));
++        }
++        return selections;
++    }
++
++    private static List<String> split(String value) {
++        final List<String> result = new ArrayList<>();
++        if (TextUtils.isEmpty(value)) {
++            return result;
++        }
++        for (String part : value.split(",")) {
++            final String trimmed = part.trim();
++            if (!trimmed.isEmpty()) {
++                result.add(trimmed);
++            }
++        }
++        return result;
++    }
++
++    public Set<String> getGames() {
++        return new HashSet<>(mGames);
++    }
++
++    public void addGame(String packageName) {
++        if (TextUtils.isEmpty(packageName) || !mGames.add(packageName)) {
++            return;
++        }
++        // Marking a package as a game turns both notification tweaks on by default.
++        mSuppressHeadsUp.add(packageName);
++        mMute.add(packageName);
++        writeGames();
++        writeSuppressHeadsUp();
++        writeMute();
++    }
++
++    public void removeGame(String packageName) {
++        if (TextUtils.isEmpty(packageName)) {
++            return;
++        }
++        final boolean changed = mGames.remove(packageName);
++        mSuppressHeadsUp.remove(packageName);
++        mMute.remove(packageName);
++        if (changed) {
++            writeGames();
++            writeSuppressHeadsUp();
++            writeMute();
++            // Dropping a game also drops the ANGLE pin, but not a driver the user picked
++            // manually through Developer options.
++            setUseAngle(packageName, false);
++        }
++    }
++
++    public void setSuppressHeadsUp(String packageName, boolean enabled) {
++        if (TextUtils.isEmpty(packageName)) {
++            return;
++        }
++        if (enabled ? mSuppressHeadsUp.add(packageName) : mSuppressHeadsUp.remove(packageName)) {
++            writeSuppressHeadsUp();
++        }
++    }
++
++    public void setMute(String packageName, boolean enabled) {
++        if (TextUtils.isEmpty(packageName)) {
++            return;
++        }
++        if (enabled ? mMute.add(packageName) : mMute.remove(packageName)) {
++            writeMute();
++        }
++    }
++
++    private void writeGames() {
++        Settings.Secure.putString(mContext.getContentResolver(),
++                Settings.Secure.GAME_MODE_PACKAGES, TextUtils.join(",", mGames));
++    }
++
++    private void writeSuppressHeadsUp() {
++        Settings.Secure.putString(mContext.getContentResolver(),
++                Settings.Secure.GAME_MODE_SUPPRESS_HEADS_UP, TextUtils.join(",", mSuppressHeadsUp));
++    }
++
++    private void writeMute() {
++        Settings.Secure.putString(mContext.getContentResolver(),
++                Settings.Secure.GAME_MODE_MUTE, TextUtils.join(",", mMute));
++    }
++
++    private static Set<String> parse(String value) {
++        return new HashSet<>(split(value));
++    }
++
++    private Set<String> read(String key) {
++        return parse(Settings.Secure.getStringForUser(mContext.getContentResolver(),
++                key, UserHandle.USER_CURRENT));
++    }
++
++    class SettingsObserver extends ContentObserver {
++        SettingsObserver(Handler handler) {
++            super(handler);
++        }
++
++        void observe() {
++            mContext.getContentResolver().registerContentObserver(
++                    Settings.Secure.getUriFor(Settings.Secure.GAME_MODE_PACKAGES),
++                    false, this, UserHandle.USER_ALL);
++            mContext.getContentResolver().registerContentObserver(
++                    Settings.Secure.getUriFor(Settings.Secure.GAME_MODE_SUPPRESS_HEADS_UP),
++                    false, this, UserHandle.USER_ALL);
++            mContext.getContentResolver().registerContentObserver(
++                    Settings.Secure.getUriFor(Settings.Secure.GAME_MODE_MUTE),
++                    false, this, UserHandle.USER_ALL);
++            update();
++        }
++
++        @Override
++        public void onChange(boolean selfChange) {
++            update();
++        }
++
++        void update() {
++            try {
++                mGames = read(Settings.Secure.GAME_MODE_PACKAGES);
++                mSuppressHeadsUp = read(Settings.Secure.GAME_MODE_SUPPRESS_HEADS_UP);
++                mMute = read(Settings.Secure.GAME_MODE_MUTE);
++                mLoaded = true;
++            } catch (RuntimeException e) {
++                Log.w(TAG, "Could not read the game mode lists yet", e);
++            }
++        }
++    }
++}
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/notification/interruption/CommonVisualInterruptionSuppressors.kt b/packages/SystemUI/src/com/android/systemui/statusbar/notification/interruption/CommonVisualInterruptionSuppressors.kt
+index 1343ea150..392f7e083 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/notification/interruption/CommonVisualInterruptionSuppressors.kt
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/notification/interruption/CommonVisualInterruptionSuppressors.kt
+@@ -45,6 +45,7 @@ import android.provider.Settings.Global.HEADS_UP_OFF
+ import android.service.notification.Flags
+ import com.android.internal.logging.UiEvent
+ import com.android.internal.logging.UiEventLogger
++import com.android.internal.util.GameModeController
+ import com.android.internal.messages.nano.SystemMessageProto.SystemMessage
+ import com.android.systemui.dagger.qualifiers.Main
+ import com.android.systemui.plugins.statusbar.StatusBarStateController
+@@ -511,3 +512,28 @@ class AvalancheSuppressor(
+         return isEnabled
+     }
+ }
++
++/**
++ * Suppresses heads-up notifications while a game the user marked as quiet is on screen.
++ *
++ * The package list and the per app preference are maintained from Settings and stored in
++ * [android.provider.Settings.Secure], so they can also be edited with
++ * `adb shell settings put secure game_mode_suppress_heads_up "com.foo,com.bar"`.
++ */
++class PeekGameModeSuppressor(context: Context) :
++    VisualInterruptionCondition(types = setOf(PEEK), reason = "game mode is active") {
++
++    private val gameModeController = GameModeController(context)
++    private val foregroundTracker = GameModeForegroundTracker()
++
++    override fun start() {
++        // Start tracking before the first notification arrives, otherwise the very first
++        // heads-up has no cached answer and always interrupts.
++        foregroundTracker.getForegroundPackage()
++    }
++
++    override fun shouldSuppress(): Boolean {
++        if (!gameModeController.hasSuppressedGames()) return false
++        return gameModeController.shouldSuppressHeadsUp(foregroundTracker.getForegroundPackage())
++    }
++}
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/notification/interruption/GameModeForegroundTracker.kt b/packages/SystemUI/src/com/android/systemui/statusbar/notification/interruption/GameModeForegroundTracker.kt
+new file mode 100644
+index 000000000..81550fa59
+--- /dev/null
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/notification/interruption/GameModeForegroundTracker.kt
+@@ -0,0 +1,69 @@
++/*
++ * Copyright (C) 2026 The PixelOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.systemui.statusbar.notification.interruption
++
++import android.app.ActivityManager.RunningTaskInfo
++import android.app.IActivityTaskManager
++import android.app.TaskStackListener
++import android.app.WindowConfiguration.WINDOWING_MODE_FULLSCREEN
++import android.content.Context.ACTIVITY_TASK_SERVICE
++import android.os.ServiceManager
++import android.util.Log
++
++/**
++ * Caches the package of the task currently in front.
++ *
++ * The heads-up decision runs on the main thread for every notification, so asking the activity
++ * task manager for the top task each time costs a synchronous binder round trip. Tracking task
++ * changes instead keeps the read to a volatile field access.
++ */
++class GameModeForegroundTracker : TaskStackListener() {
++
++    @Volatile private var foregroundPackage: String? = null
++    private var registered = false
++
++    /** @return package of the task that most recently moved to front, or null when unknown. */
++    fun getForegroundPackage(): String? {
++        ensureRegistered()
++        return foregroundPackage
++    }
++
++    @Synchronized
++    private fun ensureRegistered() {
++        if (registered) {
++            return
++        }
++        val activityTaskManager =
++            IActivityTaskManager.Stub.asInterface(
++                ServiceManager.getService(ACTIVITY_TASK_SERVICE)
++            ) ?: return
++        runCatching { activityTaskManager.registerTaskStackListener(this) }
++            .onSuccess { registered = true }
++            .onFailure { Log.w(TAG, "Could not register the task stack listener", it) }
++    }
++
++    override fun onTaskMovedToFront(taskInfo: RunningTaskInfo?) {
++        // Only a fullscreen task counts as "the user is playing". Split screen and freeform
++        // leave the cache empty so notifications are handled normally.
++        val isFullscreen = taskInfo?.windowingMode == WINDOWING_MODE_FULLSCREEN
++        foregroundPackage = if (isFullscreen) taskInfo?.topActivity?.packageName else null
++    }
++
++    companion object {
++        private const val TAG = "GameModeForegroundTracker"
++    }
++}
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/notification/interruption/VisualInterruptionDecisionProviderImpl.kt b/packages/SystemUI/src/com/android/systemui/statusbar/notification/interruption/VisualInterruptionDecisionProviderImpl.kt
+index aeb144a83..c4161075c 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/notification/interruption/VisualInterruptionDecisionProviderImpl.kt
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/notification/interruption/VisualInterruptionDecisionProviderImpl.kt
+@@ -169,6 +169,7 @@ constructor(
+         addFilter(PeekDndSuppressor())
+         addFilter(PeekNotImportantSuppressor())
+         addCondition(PeekDeviceNotInUseSuppressor(powerManager, statusBarStateController))
++        addCondition(PeekGameModeSuppressor(context))
+         addFilter(PeekOldWhenSuppressor(systemClock))
+         addFilter(PulseEffectSuppressor())
+         addFilter(PulseLockscreenVisibilityPrivateSuppressor())
+diff --git a/services/core/java/com/android/server/app/GameClassifierImpl.java b/services/core/java/com/android/server/app/GameClassifierImpl.java
+index 8f5b0f0a5..f0769e17c 100644
+--- a/services/core/java/com/android/server/app/GameClassifierImpl.java
++++ b/services/core/java/com/android/server/app/GameClassifierImpl.java
+@@ -21,29 +21,44 @@ import android.content.pm.ApplicationInfo;
+ import android.content.pm.PackageManager;
+ import android.os.UserHandle;
+ 
++import androidx.annotation.Nullable;
++
++import com.android.internal.util.GameModeController;
++
+ final class GameClassifierImpl implements GameClassifier {
+ 
+     private final PackageManager mPackageManager;
++    private final GameModeController mGameModeController;
+ 
+     GameClassifierImpl(@NonNull PackageManager packageManager) {
++        this(packageManager, null);
++    }
++
++    GameClassifierImpl(@NonNull PackageManager packageManager,
++            @Nullable GameModeController gameModeController) {
+         mPackageManager = packageManager;
++        mGameModeController = gameModeController;
+     }
+ 
+     @Override
+     public boolean isGame(@NonNull String packageName, @NonNull UserHandle userHandle) {
+-        @ApplicationInfo.Category
+-        int applicationCategory = ApplicationInfo.CATEGORY_UNDEFINED;
++        // A package the user explicitly marked as a game always wins, no matter what
++        // it declares in its manifest. Most sideloaded games and emulators declare nothing.
++        if (mGameModeController != null && mGameModeController.isGame(packageName)) {
++            return true;
++        }
+ 
++        final ApplicationInfo info;
+         try {
+-            applicationCategory =
+-                    mPackageManager.getApplicationInfoAsUser(
+-                            packageName,
+-                            0,
+-                            userHandle.getIdentifier()).category;
++            info = mPackageManager.getApplicationInfoAsUser(
++                    packageName, 0, userHandle.getIdentifier());
+         } catch (PackageManager.NameNotFoundException ex) {
+             return false;
+         }
+ 
+-        return applicationCategory == ApplicationInfo.CATEGORY_GAME;
++        // android:isGame="true" and android:appCategory="game" land in different fields,
++        // honor both so games that only set the legacy attribute are classified correctly.
++        return (info.flags & ApplicationInfo.FLAG_IS_GAME) != 0
++                || info.category == ApplicationInfo.CATEGORY_GAME;
+     }
+ }
+diff --git a/services/core/java/com/android/server/app/GameManagerService.java b/services/core/java/com/android/server/app/GameManagerService.java
+index d6ea4d236..9526a3394 100644
+--- a/services/core/java/com/android/server/app/GameManagerService.java
++++ b/services/core/java/com/android/server/app/GameManagerService.java
+@@ -94,6 +94,7 @@ import com.android.internal.annotations.VisibleForTesting;
+ import com.android.internal.os.BackgroundThread;
+ import com.android.internal.util.ArrayUtils;
+ import com.android.internal.util.FrameworkStatsLog;
++import com.android.internal.util.GameModeController;
+ import com.android.server.LocalServices;
+ import com.android.server.ServiceThread;
+ import com.android.server.SystemService;
+@@ -130,6 +131,12 @@ import java.util.Set;
+  */
+ public final class GameManagerService extends IGameManagerService.Stub {
+     public static final String TAG = "GameManagerService";
++
++    // Resolution scaling applied when a game declares no game-mode-config of its own. Only the
++    // battery mode downsamples, performance and standard render at full resolution, which is
++    // what DEFAULT_SCALING (no override) already means.
++    private static final float DEFAULT_BATTERY_SCALING = 0.7f;
++
+     // event strings used for logging
+     private static final String EVENT_SET_GAME_MODE = "SET_GAME_MODE";
+     private static final String EVENT_UPDATE_CUSTOM_GAME_MODE_CONFIG =
+@@ -162,6 +169,7 @@ public final class GameManagerService extends IGameManagerService.Stub {
+     }
+ 
+     private final Context mContext;
++    private final GameModeController mGameModeController;
+     private final Object mLock = new Object();
+     private final Object mDeviceConfigLock = new Object();
+     private final Object mGameModeListenerLock = new Object();
+@@ -234,6 +242,7 @@ public final class GameManagerService extends IGameManagerService.Stub {
+     GameManagerService(Context context, Looper looper, File dataDir, Injector injector) {
+         super(PermissionEnforcer.fromContext(context));
+         mContext = context;
++        mGameModeController = new GameModeController(context);
+         mHandler = new SettingsHandler(looper);
+         mPackageManager = mContext.getPackageManager();
+         mUserManager = mContext.getSystemService(UserManager.class);
+@@ -253,7 +262,7 @@ public final class GameManagerService extends IGameManagerService.Stub {
+             mGameServiceController = new GameServiceController(
+                     context, BackgroundThread.getExecutor(),
+                     new GameServiceProviderSelectorImpl(context),
+-                    new GameServiceProviderInstanceFactoryImpl(context));
++                    new GameServiceProviderInstanceFactoryImpl(context, mGameModeController));
+         } else {
+             mGameServiceController = null;
+         }
+@@ -814,19 +823,18 @@ public final class GameManagerService extends IGameManagerService.Stub {
+         }
+ 
+         private int getAvailableGameModesBitfield() {
++            // PERFORMANCE and BATTERY are always offered. The manifest opt-in used to gate them,
++            // but it only ever described what the game is willing to have done to it, and the
++            // system now supplies its own defaults when the game declares no configuration.
+             int field = modeToBitmask(GameManager.GAME_MODE_CUSTOM)
+-                    | modeToBitmask(GameManager.GAME_MODE_STANDARD);
++                    | modeToBitmask(GameManager.GAME_MODE_STANDARD)
++                    | modeToBitmask(GameManager.GAME_MODE_PERFORMANCE)
++                    | modeToBitmask(GameManager.GAME_MODE_BATTERY);
+             synchronized (mModeConfigLock) {
+                 for (final int mode : mModeConfigs.keySet()) {
+                     field |= modeToBitmask(mode);
+                 }
+             }
+-            if (mBatteryModeOverridden) {
+-                field |= modeToBitmask(GameManager.GAME_MODE_BATTERY);
+-            }
+-            if (mPerfModeOverridden) {
+-                field |= modeToBitmask(GameManager.GAME_MODE_PERFORMANCE);
+-            }
+             return field;
+         }
+ 
+@@ -1042,10 +1050,16 @@ public final class GameManagerService extends IGameManagerService.Stub {
+     }
+ 
+     private boolean isPackageGame(String packageName, @UserIdInt int userId) {
++        // Games the user marked in Settings take precedence over the manifest, most sideloaded
++        // games and emulators never declare a category.
++        if (mGameModeController.isGame(packageName)) {
++            return true;
++        }
+         try {
+             final ApplicationInfo applicationInfo = mPackageManager
+                     .getApplicationInfoAsUser(packageName, PackageManager.MATCH_ALL, userId);
+-            return applicationInfo.category == ApplicationInfo.CATEGORY_GAME;
++            return (applicationInfo.flags & ApplicationInfo.FLAG_IS_GAME) != 0
++                    || applicationInfo.category == ApplicationInfo.CATEGORY_GAME;
+         } catch (PackageManager.NameNotFoundException e) {
+             return false;
+         }
+@@ -1385,13 +1399,30 @@ public final class GameManagerService extends IGameManagerService.Stub {
+ 
+     float getResolutionScalingFactorInternal(String packageName, int gameMode, int userId) {
+         final GamePackageConfiguration packageConfig = getConfig(packageName, userId);
+-        if (packageConfig == null) {
+-            return GamePackageConfiguration.GameModeConfiguration.DEFAULT_SCALING;
++        if (packageConfig != null) {
++            final GamePackageConfiguration.GameModeConfiguration modeConfig =
++                    packageConfig.getGameModeConfiguration(gameMode);
++            if (modeConfig != null) {
++                return modeConfig.getScaling();
++            }
++            // The game declared that it handles this mode itself, do not second guess it.
++            if (packageConfig.willGamePerformOptimizations(gameMode)) {
++                return GamePackageConfiguration.GameModeConfiguration.DEFAULT_SCALING;
++            }
+         }
+-        final GamePackageConfiguration.GameModeConfiguration modeConfig =
+-                packageConfig.getGameModeConfiguration(gameMode);
+-        if (modeConfig != null) {
+-            return modeConfig.getScaling();
++        return getDefaultScalingForMode(gameMode);
++    }
++
++    /**
++     * Resolution scaling used when a game declares no configuration of its own for the mode.
++     *
++     * <p>This is what makes {@link GameManager#GAME_MODE_BATTERY} do something for the vast
++     * majority of games, which never ship a game-mode-config. Every other mode resolves to
++     * "no override", so full resolution.
++     */
++    private static float getDefaultScalingForMode(int gameMode) {
++        if (gameMode == GameManager.GAME_MODE_BATTERY) {
++            return DEFAULT_BATTERY_SCALING;
+         }
+         return GamePackageConfiguration.GameModeConfiguration.DEFAULT_SCALING;
+     }
+diff --git a/services/core/java/com/android/server/app/GameServiceProviderInstanceFactoryImpl.java b/services/core/java/com/android/server/app/GameServiceProviderInstanceFactoryImpl.java
+index 50e529c66..d717b1410 100644
+--- a/services/core/java/com/android/server/app/GameServiceProviderInstanceFactoryImpl.java
++++ b/services/core/java/com/android/server/app/GameServiceProviderInstanceFactoryImpl.java
+@@ -32,6 +32,7 @@ import android.service.games.IGameSessionService;
+ 
+ import com.android.internal.infra.ServiceConnector;
+ import com.android.internal.os.BackgroundThread;
++import com.android.internal.util.GameModeController;
+ import com.android.internal.util.ScreenshotHelper;
+ import com.android.server.LocalServices;
+ import com.android.server.app.GameServiceConfiguration.GameServiceComponentConfiguration;
+@@ -41,9 +42,16 @@ import com.android.server.wm.WindowManagerService;
+ 
+ final class GameServiceProviderInstanceFactoryImpl implements GameServiceProviderInstanceFactory {
+     private final Context mContext;
++    private final GameModeController mGameModeController;
+ 
+     GameServiceProviderInstanceFactoryImpl(@NonNull Context context) {
++        this(context, new GameModeController(context));
++    }
++
++    GameServiceProviderInstanceFactoryImpl(@NonNull Context context,
++            @NonNull GameModeController gameModeController) {
+         mContext = context;
++        mGameModeController = gameModeController;
+     }
+ 
+     @NonNull
+@@ -57,7 +65,7 @@ final class GameServiceProviderInstanceFactoryImpl implements GameServiceProvide
+                 BackgroundThread.getExecutor(),
+                 mContext,
+                 new GameTaskInfoProvider(userHandle, activityTaskManager,
+-                        new GameClassifierImpl(mContext.getPackageManager())),
++                        new GameClassifierImpl(mContext.getPackageManager(), mGameModeController)),
+                 ActivityManager.getService(),
+                 LocalServices.getService(ActivityManagerInternal.class),
+                 activityTaskManager,
+diff --git a/services/core/java/com/android/server/notification/GameModeForegroundTracker.java b/services/core/java/com/android/server/notification/GameModeForegroundTracker.java
+new file mode 100644
+index 000000000..420a0f0b8
+--- /dev/null
++++ b/services/core/java/com/android/server/notification/GameModeForegroundTracker.java
+@@ -0,0 +1,88 @@
++/*
++ * Copyright (C) 2026 The PixelOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.server.notification;
++
++import android.annotation.Nullable;
++import android.app.ActivityManager.RunningTaskInfo;
++import android.app.ActivityTaskManager;
++import android.app.IActivityTaskManager;
++import android.app.WindowConfiguration;
++import android.app.TaskStackListener;
++import android.content.ComponentName;
++import android.os.RemoteException;
++import android.util.Slog;
++
++/**
++ * Caches the package of the task currently in front.
++ *
++ * <p>NotificationManagerService needs to know whether the user is inside a game while it holds
++ * its own lock. Querying ActivityTaskManagerInternal there would take the window manager global
++ * lock while the notification lock is held, which opens a lock ordering inversion with anything
++ * that calls back into the notification service under that lock. Listening to task changes keeps
++ * the read lock free.
++ */
++final class GameModeForegroundTracker extends TaskStackListener {
++
++    private static final String TAG = "GameModeForegroundTracker";
++
++    @Nullable private volatile String mForegroundPackage;
++    private volatile boolean mRegistered;
++
++    GameModeForegroundTracker() {
++        ensureRegistered();
++    }
++
++    /**
++     * @return package of the task that most recently moved to front, or null when unknown.
++     */
++    @Nullable
++    String getForegroundPackage() {
++        ensureRegistered();
++        return mForegroundPackage;
++    }
++
++    // The activity task manager may not be published yet when the notification service is
++    // created, so registration is retried until it succeeds.
++    private synchronized void ensureRegistered() {
++        if (mRegistered) {
++            return;
++        }
++        final IActivityTaskManager atm = ActivityTaskManager.getService();
++        if (atm == null) {
++            return;
++        }
++        try {
++            atm.registerTaskStackListener(this);
++            mRegistered = true;
++        } catch (RemoteException | RuntimeException e) {
++            Slog.w(TAG, "Could not register the task stack listener", e);
++        }
++    }
++
++    @Override
++    public void onTaskMovedToFront(RunningTaskInfo taskInfo) throws RemoteException {
++        // Only a fullscreen task counts as "the user is playing". Split screen and freeform
++        // leave the cache empty so notifications are handled normally.
++        final boolean isFullscreen =
++                taskInfo != null
++                        && taskInfo.getWindowingMode()
++                                == WindowConfiguration.WINDOWING_MODE_FULLSCREEN;
++        final ComponentName topActivity = taskInfo != null ? taskInfo.topActivity : null;
++        mForegroundPackage =
++                (isFullscreen && topActivity != null) ? topActivity.getPackageName() : null;
++    }
++}
+diff --git a/services/core/java/com/android/server/notification/NotificationAttentionHelper.java b/services/core/java/com/android/server/notification/NotificationAttentionHelper.java
+index 26339003d..2b627aad8 100644
+--- a/services/core/java/com/android/server/notification/NotificationAttentionHelper.java
++++ b/services/core/java/com/android/server/notification/NotificationAttentionHelper.java
+@@ -78,6 +78,7 @@ import com.android.internal.config.sysui.SystemUiSystemPropertiesFlags.Notificat
+ import com.android.internal.logging.MetricsLogger;
+ import com.android.internal.logging.nano.MetricsProto;
+ import com.android.internal.logging.nano.MetricsProto.MetricsEvent;
++import com.android.internal.util.GameModeController;
+ import com.android.internal.util.VibrationStatsWriter;
+ import com.android.server.EventLogTags;
+ import com.android.server.lights.LightsManager;
+@@ -138,6 +139,7 @@ public final class NotificationAttentionHelper {
+     static final int MUTE_REASON_OTHER_INSISTENT_PLAYING = 1 << 13;
+     static final int MUTE_REASON_SUPPRESSED_BUBBLE = 1 << 14;
+     static final int MUTE_REASON_COOLDOWN = 1 << 15;
++    static final int MUTE_REASON_GAME_MODE = 1 << 16;
+ 
+     @IntDef(prefix = { "MUTE_REASON_" }, value = {
+         MUTE_REASON_NOT_MUTED,
+@@ -152,6 +154,7 @@ public final class NotificationAttentionHelper {
+         MUTE_REASON_OTHER_INSISTENT_PLAYING,
+         MUTE_REASON_SUPPRESSED_BUBBLE,
+         MUTE_REASON_COOLDOWN,
++        MUTE_REASON_GAME_MODE,
+     })
+     @Retention(RetentionPolicy.SOURCE)
+     @interface MuteReason {}
+@@ -173,6 +176,8 @@ public final class NotificationAttentionHelper {
+     private final NotificationUsageStats mUsageStats;
+     private final ZenModeHelper mZenModeHelper;
+     private final ActivityTaskManager mActivityTaskManager;
++    private final GameModeController mGameModeController;
++    private final GameModeForegroundTracker mGameModeForegroundTracker;
+ 
+     private VibratorHelper mVibratorHelper;
+     private VibrationStatsWriter mVibrationStatsWriter;
+@@ -237,6 +242,8 @@ public final class NotificationAttentionHelper {
+         mZenModeHelper = zenModeHelper;
+         mFlagResolver = flagResolver;
+         mActivityTaskManager = context.getSystemService(ActivityTaskManager.class);
++        mGameModeController = new GameModeController(context);
++        mGameModeForegroundTracker = new GameModeForegroundTracker();
+ 
+         mVibratorHelper = new VibratorHelper(context);
+         mVibrationStatsWriter = vibrationStatsWriter;
+@@ -695,6 +702,11 @@ public final class NotificationAttentionHelper {
+         if (!hasAudibleAlert) {
+             return MUTE_REASON_NOT_AUDIBLE;
+         }
++        // Suppressed because a game the user asked to keep quiet is in the foreground
++        if (mGameModeController.hasMutedGames()
++                && mGameModeController.shouldMute(mGameModeForegroundTracker.getForegroundPackage())) {
++            return MUTE_REASON_GAME_MODE;
++        }
+         // Suppressed because it's a silent update
+         final Notification notification = record.getNotification();
+         if (record.isUpdate && (notification.flags & FLAG_ONLY_ALERT_ONCE) != 0) {
+-- 
+2.53.0
+

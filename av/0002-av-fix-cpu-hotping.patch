@@ -1,0 +1,34 @@
+From 428b97b590d726b3b1790d44c3be6e764857892a Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Sun, 16 Aug 2026 09:45:44 +0800
+Subject: [PATCH 2/3] av: fix cpu hotping
+
+Change-Id: Ic9898d1d27a140f92617f19bc3b3af5b3408683d
+---
+ media/module/foundation/AHandler.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/media/module/foundation/AHandler.cpp b/media/module/foundation/AHandler.cpp
+index d8b0aaf2a3..41df16536d 100644
+--- a/media/module/foundation/AHandler.cpp
++++ b/media/module/foundation/AHandler.cpp
+@@ -41,14 +41,14 @@ void AHandler::deliverMessage(const sp<AMessage> &msg) {
+ }
+ 
+ void AHandler::setDeliveryStatus(bool delivering, uint32_t what, int64_t startUs) {
+-    AutoMutex autoLock(mLock);
++//    AutoMutex autoLock(mLock);
+     mDeliveringMessage = delivering;
+     mCurrentMessageWhat = what;
+     mCurrentMessageStartTimeUs = startUs;
+ }
+ 
+ void AHandler::getDeliveryStatus(bool& delivering, uint32_t& what, int64_t& durationUs) {
+-    AutoMutex autoLock(mLock);
++//    AutoMutex autoLock(mLock);
+     delivering = mDeliveringMessage;
+     what = mCurrentMessageWhat;
+     durationUs = mCurrentMessageStartTimeUs == 0 ?
+-- 
+2.53.0
+

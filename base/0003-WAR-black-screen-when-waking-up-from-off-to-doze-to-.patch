@@ -1,0 +1,53 @@
+From 768ac1290ed3f2a225c0e6746e573e5eb7b00fac Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Tue, 25 Aug 2026 01:00:29 +0800
+Subject: [PATCH 3/4] WAR black screen when waking up from off to doze to on
+
+Change-Id: I5a6bd82cc5cf60064a9f3a8799f5c81b875bb5d2
+---
+ .../display/DisplayPowerController.java       | 25 ++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/services/core/java/com/android/server/display/DisplayPowerController.java b/services/core/java/com/android/server/display/DisplayPowerController.java
+index f1900d718..96ec2a6ab 100644
+--- a/services/core/java/com/android/server/display/DisplayPowerController.java
++++ b/services/core/java/com/android/server/display/DisplayPowerController.java
+@@ -1549,11 +1549,34 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
+             final float currentBrightness = mPowerState.getScreenBrightness();
+             final float currentSdrBrightness = mPowerState.getSdrScreenBrightness();
+ 
++            final boolean isDozingWakeup = mDozing && state == Display.STATE_ON;
++
++            if (isDozingWakeup) {
++                // Quirk: adjust brightness a little bit, so some brightness update command
++                // will be sent to the panel and wake it up from screen-off state.
++                final float delta = 0.0001f;
++                if (animateValue == currentBrightness) {
++                    if (animateValue + delta > 1.0f) {
++                        animateValue -= delta;
++                    } else {
++                        animateValue += delta;
++                    }
++                }
++                if (sdrAnimateValue == currentSdrBrightness) {
++                    if (sdrAnimateValue + delta > 1.0f) {
++                        sdrAnimateValue -= delta;
++                    } else {
++                        sdrAnimateValue += delta;
++                    }
++                }
++                Slog.d(mTag, "WAR panel quirk: currentBrightness=" + currentBrightness + ", animateValue=" + animateValue + ", currentSdrBrightness=" + currentSdrBrightness + ", sdrAnimateValue=" + sdrAnimateValue);
++            }
++
+             if (BrightnessUtils.isValidBrightnessValue(animateValue)
+                     && (animateValue != currentBrightness
+                     || sdrAnimateValue != currentSdrBrightness)) {
+                 boolean skipAnimation = initialRampSkip || hasBrightnessBuckets
+-                        || !isDisplayContentVisible || brightnessIsTemporary;
++                        || !isDisplayContentVisible || brightnessIsTemporary || isDozingWakeup;
+                 final boolean isHdrOnlyChange = BrightnessSynchronizer.floatEquals(
+                         sdrAnimateValue, currentSdrBrightness);
+                 if (mFlags.isFastHdrTransitionsEnabled() && !skipAnimation && isHdrOnlyChange) {
+-- 
+2.53.0
+

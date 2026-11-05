@@ -1,0 +1,59 @@
+From 29e9062f9c3f8b26e9ddaf7d24323a81f3064fc6 Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Sun, 13 Sep 2026 15:45:40 +0800
+Subject: [PATCH 3/3] audioserver: load vendor libaudiohalvendorextn.so
+
+Change-Id: I3ba25beb8235437b3188b9eddd4f575b32f69428
+---
+ media/audioserver/main_audioserver.cpp | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/media/audioserver/main_audioserver.cpp b/media/audioserver/main_audioserver.cpp
+index c94fa8e45a..af91da19b8 100644
+--- a/media/audioserver/main_audioserver.cpp
++++ b/media/audioserver/main_audioserver.cpp
+@@ -19,6 +19,7 @@
+ 
+ #include <algorithm>
+ 
++#include <dlfcn.h>
+ #include <fcntl.h>
+ #include <sys/prctl.h>
+ #include <sys/wait.h>
+@@ -47,6 +48,24 @@ using android::media::audio::common::AudioMMapPolicy;
+ using android::media::audio::common::AudioMMapPolicyInfo;
+ using android::media::audio::common::AudioMMapPolicyType;
+ 
++void load_audiohalvendorextn() {
++    // Open the dll
++    void *autoHALVendorExtn = dlopen("libaudiohalvendorextn.so", RTLD_NODELETE | RTLD_NOW);
++    if (autoHALVendorExtn == nullptr) {
++        ALOGE("Failed to load library: libaudiohalvendorextn.so (%s)", dlerror());
++        return;
++    }
++
++    typedef void (*registerInterfaceFn)();
++    auto registerInterface = (registerInterfaceFn)dlsym(autoHALVendorExtn, "registerInterface");
++    if (registerInterface == nullptr) {
++        ALOGE("Failed to find symbol(registerInterface): error (%s)", dlerror());
++        return;
++    }
++
++    registerInterface();
++}
++
+ int main(int argc __unused, char **argv __unused)
+ {
+     SLOGI("%s: starting", __func__);
+@@ -65,6 +84,8 @@ int main(int argc __unused, char **argv __unused)
+     // this automatically when called from AudioPolicy, but we do this anyways here.
+     ProcessState::self()->startThreadPool();
+ 
++    load_audiohalvendorextn();
++
+     // Instantiating AudioFlinger (making it public, e.g. through ::initialize())
+     // and then instantiating AudioPolicy (and making it public)
+     // leads to situations where AudioFlinger is accessed remotely before
+-- 
+2.53.0
+

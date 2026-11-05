@@ -1,0 +1,38 @@
+From 33fe9c060894e3c12b5b175a3e0ecf0a40d6f354 Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Wed, 4 Nov 2026 11:38:50 +0800
+Subject: [PATCH] audio: FCC limit 13 for 360RA
+
+The 360RA MPEG-H decoder outputs 13 channel PCM (CHANNEL_OUT_13POINT0).
+Raise FCC_LIMIT to FCC_13 so AudioFlinger accepts it.
+
+Change-Id: I2c9e6a4b8d1f3e7a0b5c9d2f6a8e1b3c7d0f5a94
+---
+ audio/include/system/audio.h | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/audio/include/system/audio.h b/audio/include/system/audio.h
+index e9d6002..0e63c09 100644
+--- a/audio/include/system/audio.h
++++ b/audio/include/system/audio.h
+@@ -238,6 +238,7 @@ enum {
+     FCC_2 = 2,
+     FCC_8 = 8,
+     FCC_12 = 12,
++    FCC_13 = 13,
+     FCC_24 = 24,
+     FCC_26 = 26,
+     // FCC_LIMIT is the maximum PCM channel count supported through
+@@ -245,7 +246,8 @@ enum {
+     //
+     // This can be adjusted onto a value such as FCC_12 or FCC_26
+     // if the device HAL can support it.  Do not reduce below FCC_8.
+-    FCC_LIMIT = FCC_12,
++    // 360RA MPEG-H decoder xuat PCM 13ch (CHANNEL_OUT_13POINT0).
++    FCC_LIMIT = FCC_13,
+ };
+ 
+ /* A channel mask per se only defines the presence or absence of a channel, not the order.
+-- 
+2.53.0
+

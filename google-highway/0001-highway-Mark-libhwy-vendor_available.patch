@@ -1,0 +1,25 @@
+From 97655dcfb3ba387a4722a8836d20e3f1e20881df Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Mon, 2 Nov 2026 18:02:39 +0800
+Subject: [PATCH] highway: Mark libhwy vendor_available
+
+Change-Id: I20266440b1e14264620b37a858dc020bc1623298
+---
+ Android.bp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/Android.bp b/Android.bp
+index b2febd1..c907cd6 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -35,6 +35,7 @@ cc_library_headers {
+ cc_library {
+     name: "libhwy",
+     host_supported: true,
++    vendor_available: true,
+     sdk_version: "current",
+     stl: "c++_shared",
+     export_include_dirs: [
+-- 
+2.53.0
+

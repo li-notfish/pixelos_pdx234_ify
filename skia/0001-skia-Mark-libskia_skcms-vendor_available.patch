@@ -1,0 +1,25 @@
+From 93abe994f7a7bbbb0421067290fb8936f9b3eb84 Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Mon, 2 Nov 2026 18:02:39 +0800
+Subject: [PATCH] skia: Mark libskia_skcms vendor_available
+
+Change-Id: I256ed9bea5710e272c0d9ad1f500e6ef57e9c3d2
+---
+ Android.bp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/Android.bp b/Android.bp
+index ff23e96..026bb79 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -1158,6 +1158,7 @@ gensrcs {
+ cc_library_static {
+     name: "libskia_skcms",
+     host_supported: true,
++    vendor_available: true,
+     sdk_version: "current",
+     srcs: [
+         "modules/skcms/skcms.cc",
+-- 
+2.53.0
+

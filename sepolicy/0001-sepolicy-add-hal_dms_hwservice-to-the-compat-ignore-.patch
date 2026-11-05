@@ -1,0 +1,100 @@
+From 7ecf6e104cfd20dc80db1c178795c90d60701b54 Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Thu, 5 Nov 2026 01:04:43 +0800
+Subject: [PATCH] sepolicy: add hal_dms_hwservice to the compat ignore lists
+
+hal_dms_hwservice is declared in the system_ext public policy so that
+audioserver can find the Dolby DMS HAL. New public types must be listed
+in every versioned compat ignore file, otherwise treble_sepolicy_tests
+fails with:
+
+  SELinux: The following public types were found added to the policy
+  without an entry into the compatibility mapping file(s) ... :
+  hal_dms_hwservice
+
+Change-Id: I5b8f2c0a9d6e4b7f1c3a8e2d5b9f0c6a4e7d1b83
+---
+ private/compat/202404/202404.ignore.cil | 1 +
+ private/compat/202504/202504.ignore.cil | 1 +
+ private/compat/202604/202604.ignore.cil | 2 +-
+ private/compat/31.0/31.0.ignore.cil     | 1 +
+ private/compat/32.0/32.0.ignore.cil     | 3 ++-
+ private/compat/33.0/33.0.ignore.cil     | 1 +
+ private/compat/34.0/34.0.ignore.cil     | 1 +
+ 7 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/private/compat/202404/202404.ignore.cil b/private/compat/202404/202404.ignore.cil
+index c6ccb59..9301489 100644
+--- a/private/compat/202404/202404.ignore.cil
++++ b/private/compat/202404/202404.ignore.cil
+@@ -45,4 +45,5 @@
+     wifi_usd_service
+     early_virtmgr_vendor
+     virtualizationmanager_vendor
++    hal_dms_hwservice
+   ))
+diff --git a/private/compat/202504/202504.ignore.cil b/private/compat/202504/202504.ignore.cil
+index a45d73e..c5551bd 100644
+--- a/private/compat/202504/202504.ignore.cil
++++ b/private/compat/202504/202504.ignore.cil
+@@ -43,4 +43,5 @@
+     mmd_setup
+     contextual_mode_service
+     system_server_wrapfd
++    hal_dms_hwservice
+   ))
+diff --git a/private/compat/202604/202604.ignore.cil b/private/compat/202604/202604.ignore.cil
+index dd91472..f3d22b2 100644
+--- a/private/compat/202604/202604.ignore.cil
++++ b/private/compat/202604/202604.ignore.cil
+@@ -5,5 +5,5 @@
+ (typeattribute new_objects)
+ (typeattributeset new_objects
+   ( new_objects
+-    
++    hal_dms_hwservice
+   ))
+diff --git a/private/compat/31.0/31.0.ignore.cil b/private/compat/31.0/31.0.ignore.cil
+index 0e39f3e..7f2dd79 100644
+--- a/private/compat/31.0/31.0.ignore.cil
++++ b/private/compat/31.0/31.0.ignore.cil
+@@ -49,4 +49,5 @@
+     vendor_vm_file
+     vendor_vm_data_file
+     virtual_device_service
++    hal_dms_hwservice
+   ))
+diff --git a/private/compat/32.0/32.0.ignore.cil b/private/compat/32.0/32.0.ignore.cil
+index dd74cd8..d6c4051 100644
+--- a/private/compat/32.0/32.0.ignore.cil
++++ b/private/compat/32.0/32.0.ignore.cil
+@@ -83,4 +83,5 @@
+     vendor_vm_file
+     virtual_device_service
+     wallpaper_effects_generation_service
+-))
++    hal_dms_hwservice
++  ))
+diff --git a/private/compat/33.0/33.0.ignore.cil b/private/compat/33.0/33.0.ignore.cil
+index f041d97..63b45fd 100644
+--- a/private/compat/33.0/33.0.ignore.cil
++++ b/private/compat/33.0/33.0.ignore.cil
+@@ -92,4 +92,5 @@
+     zoned_block_device
+     future_pm_prop
+     vfio_device
++    hal_dms_hwservice
+   ))
+diff --git a/private/compat/34.0/34.0.ignore.cil b/private/compat/34.0/34.0.ignore.cil
+index b82f831..4b5778d 100644
+--- a/private/compat/34.0/34.0.ignore.cil
++++ b/private/compat/34.0/34.0.ignore.cil
+@@ -54,4 +54,5 @@
+     enable_16k_pages_prop
+     proc_cgroups
+     media_quality_service
++    hal_dms_hwservice
+   ))
+-- 
+2.53.0
+

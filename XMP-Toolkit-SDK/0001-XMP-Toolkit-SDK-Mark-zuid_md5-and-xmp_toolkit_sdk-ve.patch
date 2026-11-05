@@ -1,0 +1,34 @@
+From c9e6d307678b6fda2fffec03f06ee89c5c4ebb5a Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Mon, 2 Nov 2026 18:02:39 +0800
+Subject: [PATCH] XMP-Toolkit-SDK: Mark zuid_md5 and xmp_toolkit_sdk
+ vendor_available
+
+Change-Id: I642a5eee15e0ca00a67c1353005bed7a6c82867d
+---
+ Android.bp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/Android.bp b/Android.bp
+index 285475c..2770b55 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -16,6 +16,7 @@ license {
+ cc_library {
+     name: "zuid_md5",
+     host_supported: true,
++    vendor_available: true,
+     sdk_version: "current",
+     stl: "c++_shared",
+     target: {
+@@ -37,6 +38,7 @@ cc_library {
+ cc_library {
+     name: "xmp_toolkit_sdk",
+     host_supported: true,
++    vendor_available: true,
+     sdk_version: "current",
+     stl: "c++_shared",
+     export_include_dirs: [
+-- 
+2.53.0
+

@@ -1,0 +1,871 @@
+From d51db13f7dbd5602ec746cc0b3cacb1c87a46abc Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Thu, 29 Oct 2026 20:09:15 +0800
+Subject: [PATCH] Settings: add a game mode screen
+
+Apps -> Game mode lists the installed apps. Tapping an entry opens a per
+game screen with the app name on top, the game mode selector, one toggle
+per behaviour and a save / back bar at the bottom:
+
+  Game mode             Standard / Performance / Battery, handed to the
+                        system game manager
+  Notification banners  do not pop up while this game is running
+  Mute notifications    no sound and no vibration
+  ANGLE renderer        pin the game to the ANGLE GL driver
+
+Nothing is written until the user hits save, so backing out leaves the
+game untouched. Saving marks the package as a game; long pressing an
+entry in the list removes it again. The list and the flags live in
+Settings.Secure, so they can also be maintained with adb.
+
+Two things the layout has to work around: the activity theme inherits
+from Theme.DeviceDefault.Settings, so every Material widget needs its own
+android:theme, and ?attr/materialButtonOutlinedStyle must be avoided
+because themes_bridge points it at a Material 2 style whose textAppearance
+the platform theme lacks. The segmented selector therefore reuses the
+styles SegmentedButtonPreference already ships.
+
+BaseAppListSettingsFragment gains hooks to navigate on tap and refresh on
+resume instead of toggling the entry, and its selection bookkeeping is
+keyed by package name rather than list position, which shifted as soon as
+the list was re-sorted.
+
+Change-Id: Ibe4914b1a566f0d5278ac82f60e6246aa745a95b
+---
+ AndroidManifest.xml                           |  18 ++
+ res/layout/game_mode_app_settings.xml         | 284 ++++++++++++++++++
+ res/values/strings.xml                        |  33 ++
+ res/xml/apps.xml                              |   7 +
+ .../core/BaseAppListSettingsFragment.kt       |  68 +++--
+ .../android/settings/game/GameAppSettings.kt  | 203 +++++++++++++
+ .../android/settings/game/GameModeSettings.kt |  97 ++++++
+ 7 files changed, 690 insertions(+), 20 deletions(-)
+ create mode 100644 res/layout/game_mode_app_settings.xml
+ create mode 100644 src/com/android/settings/game/GameAppSettings.kt
+ create mode 100644 src/com/android/settings/game/GameModeSettings.kt
+
+diff --git a/AndroidManifest.xml b/AndroidManifest.xml
+index 23e503b..776c7b2 100644
+--- a/AndroidManifest.xml
++++ b/AndroidManifest.xml
+@@ -6336,6 +6336,24 @@
+             </intent-filter>
+         </service>
+ 
++        <activity-alias
++            android:name="GameModeSettingsActivity"
++            android:label="@string/game_mode_settings_title"
++            android:exported="false"
++            android:targetActivity=".Settings$AppDashboardActivity">
++            <meta-data android:name="com.android.settings.FRAGMENT_CLASS"
++                android:value="com.android.settings.game.GameModeSettings" />
++        </activity-alias>
++
++        <activity-alias
++            android:name="GameAppSettingsActivity"
++            android:label="@string/game_mode_settings_title"
++            android:exported="false"
++            android:targetActivity=".Settings$AppDashboardActivity">
++            <meta-data android:name="com.android.settings.FRAGMENT_CLASS"
++                android:value="com.android.settings.game.GameAppSettings" />
++        </activity-alias>
++
+         <!-- This is the longest AndroidManifest.xml ever. -->
+         <activity-alias
+             android:name="DisplayCutoutForceFullscreenSettings"
+diff --git a/res/layout/game_mode_app_settings.xml b/res/layout/game_mode_app_settings.xml
+new file mode 100644
+index 0000000..3b95115
+--- /dev/null
++++ b/res/layout/game_mode_app_settings.xml
+@@ -0,0 +1,284 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++  Copyright (C) 2026 The PixelOS Project
++
++  Licensed under the Apache License, Version 2.0 (the "License");
++  you may not use this file except in compliance with the License.
++  You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++-->
++
++<LinearLayout
++    xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent"
++    android:background="?android:attr/colorBackground"
++    android:orientation="vertical">
++
++    <ScrollView
++        android:layout_width="match_parent"
++        android:layout_height="0dp"
++        android:layout_weight="1"
++        android:clipToPadding="false"
++        android:fillViewport="true">
++
++        <LinearLayout
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:orientation="vertical"
++            android:paddingStart="24dp"
++            android:paddingTop="24dp"
++            android:paddingEnd="24dp"
++            android:paddingBottom="16dp">
++
++            <!-- App header -->
++            <LinearLayout
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:gravity="center_vertical"
++                android:orientation="horizontal">
++
++                <ImageView
++                    android:id="@+id/app_icon"
++                    android:layout_width="48dp"
++                    android:layout_height="48dp"
++                    android:importantForAccessibility="no"/>
++
++                <LinearLayout
++                    android:layout_width="0dp"
++                    android:layout_height="wrap_content"
++                    android:layout_marginStart="16dp"
++                    android:layout_weight="1"
++                    android:orientation="vertical">
++
++                    <TextView
++                        android:id="@+id/app_name"
++                        android:layout_width="match_parent"
++                        android:layout_height="wrap_content"
++                        android:ellipsize="end"
++                        android:maxLines="2"
++                        android:textAppearance="@style/TextAppearance.SettingsLib.TitleLarge"/>
++
++                    <TextView
++                        android:id="@+id/app_package"
++                        android:layout_width="match_parent"
++                        android:layout_height="wrap_content"
++                        android:ellipsize="end"
++                        android:maxLines="1"
++                        android:textAppearance="@style/TextAppearance.SettingsLib.BodySmall"/>
++                </LinearLayout>
++            </LinearLayout>
++
++            <View
++                android:layout_width="match_parent"
++                android:layout_height="24dp"/>
++
++            <!-- Game mode -->
++            <TextView
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:text="@string/game_mode_play_title"
++                android:textAppearance="@style/TextAppearance.SettingsLib.BodyLarge"/>
++
++            <TextView
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:text="@string/game_mode_play_summary"
++                android:textAppearance="@style/TextAppearance.SettingsLib.BodySmall"/>
++
++            <!-- Mirrors SettingsLib's SegmentedButtonPreference. The activity theme inherits
++                 from Theme.DeviceDefault.Settings, so the subtree needs its own Material theme,
++                 and ?attr/materialButtonOutlinedStyle must be avoided: the settings bridge points
++                 it at a Material 2 style whose textAppearance the platform theme lacks. -->
++            <com.google.android.material.button.MaterialButtonToggleGroup
++                android:id="@+id/mode_group"
++                style="@style/Widget.Material3Expressive.MaterialButtonGroup.Connected"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:layout_marginTop="12dp"
++                android:theme="@style/Theme.Material3.DynamicColors.DayNight"
++                app:selectionRequired="true"
++                app:singleSelection="true">
++
++                <com.google.android.material.button.MaterialButton
++                    android:id="@+id/mode_standard"
++                    style="@style/SettingsLibButtonStyle.Expressive.Tonal.Large"
++                    android:layout_width="0dp"
++                    android:layout_height="wrap_content"
++                    android:layout_weight="1"
++                    android:text="@string/game_mode_play_standard"/>
++
++                <com.google.android.material.button.MaterialButton
++                    android:id="@+id/mode_performance"
++                    style="@style/SettingsLibButtonStyle.Expressive.Tonal.Large"
++                    android:layout_width="0dp"
++                    android:layout_height="wrap_content"
++                    android:layout_weight="1"
++                    android:text="@string/game_mode_play_performance"/>
++
++                <com.google.android.material.button.MaterialButton
++                    android:id="@+id/mode_battery"
++                    style="@style/SettingsLibButtonStyle.Expressive.Tonal.Large"
++                    android:layout_width="0dp"
++                    android:layout_height="wrap_content"
++                    android:layout_weight="1"
++                    android:text="@string/game_mode_play_battery"/>
++            </com.google.android.material.button.MaterialButtonToggleGroup>
++
++            <View
++                android:layout_width="match_parent"
++                android:layout_height="24dp"/>
++
++            <!-- Notification banners -->
++            <LinearLayout
++                android:id="@+id/row_suppress"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:background="?android:attr/selectableItemBackground"
++                android:gravity="center_vertical"
++                android:minHeight="72dp"
++                android:orientation="horizontal">
++
++                <LinearLayout
++                    android:layout_width="0dp"
++                    android:layout_height="wrap_content"
++                    android:layout_weight="1"
++                    android:orientation="vertical">
++
++                    <TextView
++                        android:layout_width="match_parent"
++                        android:layout_height="wrap_content"
++                        android:text="@string/game_mode_suppress_heads_up"
++                        android:textAppearance="@style/TextAppearance.SettingsLib.BodyLarge"/>
++
++                    <TextView
++                        android:layout_width="match_parent"
++                        android:layout_height="wrap_content"
++                        android:text="@string/game_mode_suppress_heads_up_summary"
++                        android:textAppearance="@style/TextAppearance.SettingsLib.BodySmall"/>
++                </LinearLayout>
++
++                <com.google.android.material.materialswitch.MaterialSwitch
++                    android:id="@+id/switch_suppress"
++                    style="@style/SettingslibSwitchStyle.Expressive"
++                    android:layout_width="wrap_content"
++                    android:layout_height="wrap_content"
++                    android:layout_marginStart="16dp"
++                    android:theme="@style/Theme.Material3.DynamicColors.DayNight"/>
++            </LinearLayout>
++
++            <!-- Mute -->
++            <LinearLayout
++                android:id="@+id/row_mute"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:background="?android:attr/selectableItemBackground"
++                android:gravity="center_vertical"
++                android:minHeight="72dp"
++                android:orientation="horizontal">
++
++                <LinearLayout
++                    android:layout_width="0dp"
++                    android:layout_height="wrap_content"
++                    android:layout_weight="1"
++                    android:orientation="vertical">
++
++                    <TextView
++                        android:layout_width="match_parent"
++                        android:layout_height="wrap_content"
++                        android:text="@string/game_mode_mute"
++                        android:textAppearance="@style/TextAppearance.SettingsLib.BodyLarge"/>
++
++                    <TextView
++                        android:layout_width="match_parent"
++                        android:layout_height="wrap_content"
++                        android:text="@string/game_mode_mute_summary"
++                        android:textAppearance="@style/TextAppearance.SettingsLib.BodySmall"/>
++                </LinearLayout>
++
++                <com.google.android.material.materialswitch.MaterialSwitch
++                    android:id="@+id/switch_mute"
++                    style="@style/SettingslibSwitchStyle.Expressive"
++                    android:layout_width="wrap_content"
++                    android:layout_height="wrap_content"
++                    android:layout_marginStart="16dp"
++                    android:theme="@style/Theme.Material3.DynamicColors.DayNight"/>
++            </LinearLayout>
++
++            <!-- ANGLE -->
++            <LinearLayout
++                android:id="@+id/row_angle"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:background="?android:attr/selectableItemBackground"
++                android:gravity="center_vertical"
++                android:minHeight="72dp"
++                android:orientation="horizontal">
++
++                <LinearLayout
++                    android:layout_width="0dp"
++                    android:layout_height="wrap_content"
++                    android:layout_weight="1"
++                    android:orientation="vertical">
++
++                    <TextView
++                        android:layout_width="match_parent"
++                        android:layout_height="wrap_content"
++                        android:text="@string/game_mode_angle"
++                        android:textAppearance="@style/TextAppearance.SettingsLib.BodyLarge"/>
++
++                    <TextView
++                        android:layout_width="match_parent"
++                        android:layout_height="wrap_content"
++                        android:text="@string/game_mode_angle_summary"
++                        android:textAppearance="@style/TextAppearance.SettingsLib.BodySmall"/>
++                </LinearLayout>
++
++                <com.google.android.material.materialswitch.MaterialSwitch
++                    android:id="@+id/switch_angle"
++                    style="@style/SettingslibSwitchStyle.Expressive"
++                    android:layout_width="wrap_content"
++                    android:layout_height="wrap_content"
++                    android:layout_marginStart="16dp"
++                    android:theme="@style/Theme.Material3.DynamicColors.DayNight"/>
++            </LinearLayout>
++        </LinearLayout>
++    </ScrollView>
++
++    <!-- Bottom action bar -->
++    <LinearLayout
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:gravity="center_vertical"
++        android:orientation="horizontal"
++        android:paddingStart="24dp"
++        android:paddingTop="8dp"
++        android:paddingEnd="24dp"
++        android:paddingBottom="24dp">
++
++        <com.google.android.material.button.MaterialButton
++            android:id="@+id/button_back"
++            style="@style/SettingsLibButtonStyle.Expressive.Outline.Large"
++            android:layout_width="0dp"
++            android:layout_height="wrap_content"
++            android:layout_weight="1"
++            android:text="@string/game_mode_back"/>
++
++        <com.google.android.material.button.MaterialButton
++            android:id="@+id/button_save"
++            style="@style/SettingsLibButtonStyle.Expressive.Filled.Large"
++            android:layout_width="0dp"
++            android:layout_height="wrap_content"
++            android:layout_marginStart="8dp"
++            android:layout_weight="1"
++            android:text="@string/save"/>
++    </LinearLayout>
++</LinearLayout>
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index 3221d0e..c7998a5 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -15590,4 +15590,37 @@
+     <!-- Search keywords for Human interface device access setting -->
+     <string name="keywords_access_hid">hid, human, access, device</string>
+     <!-- Access HID end -->
++
++    <!-- Game mode settings. [CHAR LIMIT=NONE] -->
++    <string name="game_mode_settings_title">Game mode</string>
++    <!-- Summary for the Game mode screen in Apps settings. [CHAR LIMIT=NONE] -->
++    <string name="game_mode_settings_summary">Pick the apps that are games, and choose whether notifications should pop up or ring while you play</string>
++    <!-- Title of the game mode selector. [CHAR LIMIT=60] -->
++    <string name="game_mode_play_title">Performance mode</string>
++    <!-- Description of the game mode selector. [CHAR LIMIT=NONE] -->
++    <string name="game_mode_play_summary">Handed to the system game manager. Only the render resolution is affected.</string>
++    <!-- Game mode: standard. [CHAR LIMIT=20] -->
++    <string name="game_mode_play_standard">Standard</string>
++    <!-- Game mode: performance, full resolution. [CHAR LIMIT=20] -->
++    <string name="game_mode_play_performance">Performance</string>
++    <!-- Game mode: battery, reduced resolution. [CHAR LIMIT=20] -->
++    <string name="game_mode_play_battery">Battery</string>
++    <!-- Toggle: suppress heads-up banners while the game is in the foreground. [CHAR LIMIT=60] -->
++    <string name="game_mode_suppress_heads_up">Notification banners</string>
++    <!-- Description of the notification banner toggle. [CHAR LIMIT=NONE] -->
++    <string name="game_mode_suppress_heads_up_summary">Keep notifications out of the screen while this game is running</string>
++    <!-- Toggle: silence notifications while the game is in the foreground. [CHAR LIMIT=60] -->
++    <string name="game_mode_mute">Mute notifications</string>
++    <!-- Description of the mute toggle. [CHAR LIMIT=NONE] -->
++    <string name="game_mode_mute_summary">No sound and no vibration while this game is running</string>
++    <!-- Toggle: render the game with ANGLE instead of the native GL driver. [CHAR LIMIT=60] -->
++    <string name="game_mode_angle">ANGLE renderer</string>
++    <!-- Description of the ANGLE toggle. [CHAR LIMIT=NONE] -->
++    <string name="game_mode_angle_summary">Translate OpenGL to Vulkan. Restart the game to apply</string>
++    <!-- Button label to leave the per game screen without saving. [CHAR LIMIT=30] -->
++    <string name="game_mode_back">Back</string>
++    <!-- Dialog title shown when long pressing a game to remove it. [CHAR LIMIT=60] -->
++    <string name="game_mode_remove_title">Remove %1$s from games?</string>
++    <!-- Dialog body for removing a game. [CHAR LIMIT=NONE] -->
++    <string name="game_mode_remove_message">Its notification and renderer settings will be reset.</string>
+ </resources>
+diff --git a/res/xml/apps.xml b/res/xml/apps.xml
+index b687497..30a7009 100644
+--- a/res/xml/apps.xml
++++ b/res/xml/apps.xml
+@@ -75,6 +75,13 @@
+             android:targetPackage="${applicationId}"/>
+     </Preference>
+ 
++    <Preference
++        android:key="game_mode"
++        android:title="@string/game_mode_settings_title"
++        android:summary="@string/game_mode_settings_summary"
++        android:order="-994"
++        android:fragment="com.android.settings.game.GameModeSettings"/>
++
+     <PreferenceCategory
+         android:key="dashboard_tile_placeholder"
+         android:order="10"/>
+diff --git a/src/com/android/settings/core/BaseAppListSettingsFragment.kt b/src/com/android/settings/core/BaseAppListSettingsFragment.kt
+index cfcaf4b..f157658 100644
+--- a/src/com/android/settings/core/BaseAppListSettingsFragment.kt
++++ b/src/com/android/settings/core/BaseAppListSettingsFragment.kt
+@@ -52,9 +52,9 @@ abstract class BaseAppListSettingsFragment : Fragment(R.layout.app_list_layout)
+     }
+     private var searchText = ""
+ 
+-    val excludeSystemApps = true
+-    val restartPackageOnChange = true
+-    val appFilter: (LauncherActivityInfo) -> Boolean = { true }
++    open val excludeSystemApps = true
++    open val restartPackageOnChange = true
++    open val appFilter: (LauncherActivityInfo) -> Boolean = { true }
+ 
+     @StringRes
+     abstract fun getTitleResId(): Int
+@@ -69,6 +69,27 @@ abstract class BaseAppListSettingsFragment : Fragment(R.layout.app_list_layout)
+      */
+     abstract fun onListUpdate(packageName: String, isChecked: Boolean)
+ 
++    /**
++     * Called when the user long presses an entry. Unlike [onListUpdate] this must not change the
++     * selection, it is meant to open extra per app configuration.
++     *
++     * @return true when the long press was handled.
++     */
++    open fun onItemLongClick(packageName: String): Boolean = false
++
++    /**
++     * Called when the user taps an entry, before the default select/unselect behaviour.
++     *
++     * @return true to consume the tap, in which case the selection is left untouched.
++     */
++    open fun onItemClick(packageName: String): Boolean = false
++
++    /** Re-reads [getInitialCheckedList] and rebinds the list. */
++    fun refreshAppList() {
++        if (!::adapter.isInitialized) return
++        refreshList()
++    }
++
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+         setHasOptionsMenu(true)
+@@ -147,7 +168,7 @@ abstract class BaseAppListSettingsFragment : Fragment(R.layout.app_list_layout)
+                             appFilter(it)
+ 
+                     }
+-                    .map { it.toAppInfo() }
++                    .map { it.toAppInfo(initialList) }
+                     .sortedWith(
+                         compareBy(
+                             { it.packageName !in initialList }, // checked items first
+@@ -166,16 +187,18 @@ abstract class BaseAppListSettingsFragment : Fragment(R.layout.app_list_layout)
+         }
+     }
+ 
+-    private fun LauncherActivityInfo.toAppInfo() =
++    private fun LauncherActivityInfo.toAppInfo(checkedPackages: List<String>) =
+         AppInfo(
+             packageName = componentName.packageName,
+             label = label.toString(),
+-            icon = getIcon(0)
++            icon = getIcon(0),
++            checked = checkedPackages.contains(componentName.packageName)
+         )
+ 
+     private inner class AppListAdapter : ListAdapter<AppInfo, AppListViewHolder>(itemCallback) {
+-        private val selectedIndices = mutableSetOf<Int>()
+-        private var initialList = getInitialCheckedList().toMutableList()
++        // Keyed by package name, positions shift when the list gets re-sorted.
++        private val selectedPackages = mutableSetOf<String>()
++        private val initializedPackages = mutableSetOf<String>()
+ 
+         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int) =
+             AppListViewHolder(
+@@ -189,29 +212,33 @@ abstract class BaseAppListSettingsFragment : Fragment(R.layout.app_list_layout)
+                 label.text = appInfo.label
+                 icon.setImageDrawable(appInfo.icon)
+                 itemView.setOnClickListener {
+-                    if (selectedIndices.contains(position)) {
+-                        selectedIndices.remove(position)
+-                        onListUpdate(packageName, false)
++                    if (onItemClick(packageName)) {
++                        return@setOnClickListener
++                    }
++                    val isChecked = !checkBox.isChecked
++                    if (isChecked) {
++                        selectedPackages.add(packageName)
+                     } else {
+-                        selectedIndices.add(position)
+-                        onListUpdate(packageName, true)
++                        selectedPackages.remove(packageName)
+                     }
++                    checkBox.isChecked = isChecked
++                    onListUpdate(packageName, isChecked)
+                     if (restartPackageOnChange) {
+                         runCatching { activityManager?.forceStopPackage(packageName) }
+                     }
+-                    notifyItemChanged(position)
+                 }
+-                if (initialList.contains(packageName)) {
+-                    initialList.remove(packageName)
+-                    selectedIndices.add(position)
++                itemView.setOnLongClickListener { onItemLongClick(packageName) }
++                // Seed the selection once per list generation, so a user toggle survives rebinds.
++                if (initializedPackages.add(packageName) && appInfo.checked) {
++                    selectedPackages.add(packageName)
+                 }
+-                checkBox.isChecked = selectedIndices.contains(position)
++                checkBox.isChecked = selectedPackages.contains(packageName)
+             }
+         }
+ 
+         override fun submitList(list: List<AppInfo>?) {
+-            initialList = getInitialCheckedList().toMutableList()
+-            selectedIndices.clear()
++            selectedPackages.clear()
++            initializedPackages.clear()
+             super.submitList(list)
+         }
+     }
+@@ -227,6 +254,7 @@ abstract class BaseAppListSettingsFragment : Fragment(R.layout.app_list_layout)
+         val packageName: String,
+         val label: String,
+         val icon: Drawable,
++        val checked: Boolean,
+     )
+ 
+     companion object {
+diff --git a/src/com/android/settings/game/GameAppSettings.kt b/src/com/android/settings/game/GameAppSettings.kt
+new file mode 100644
+index 0000000..33b9256
+--- /dev/null
++++ b/src/com/android/settings/game/GameAppSettings.kt
+@@ -0,0 +1,203 @@
++/*
++ * Copyright (C) 2026 The PixelOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.settings.game
++
++import android.app.GameManager
++import android.app.IGameManagerService
++import android.content.Context
++import android.os.Bundle
++import android.os.Handler
++import android.os.Looper
++import android.os.ServiceManager
++import android.os.UserHandle
++import android.util.Log
++import android.view.View
++import android.widget.ImageView
++import android.widget.TextView
++import androidx.fragment.app.Fragment
++import com.android.internal.util.GameModeController
++import com.android.settings.R
++import com.google.android.material.button.MaterialButtonToggleGroup
++import com.google.android.material.materialswitch.MaterialSwitch
++
++/**
++ * Per game screen: app name at the top, one toggle per behaviour, and a save / back bar.
++ *
++ * Nothing is written until the user hits save, so backing out leaves the game untouched.
++ */
++class GameAppSettings : Fragment(R.layout.game_mode_app_settings) {
++
++    private lateinit var gameModeController: GameModeController
++    private lateinit var packageName: String
++
++    private lateinit var modeGroup: MaterialButtonToggleGroup
++    private lateinit var switchSuppress: MaterialSwitch
++    private lateinit var switchMute: MaterialSwitch
++    private lateinit var switchAngle: MaterialSwitch
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++        packageName = requireArguments().getString(ARG_PACKAGE).orEmpty()
++        gameModeController = GameModeController(requireContext())
++    }
++
++    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
++        super.onViewCreated(view, savedInstanceState)
++
++        if (packageName.isEmpty()) {
++            close()
++            return
++        }
++
++        bindHeader(view)
++
++        bindGameMode(view)
++
++        switchSuppress = view.findViewById(R.id.switch_suppress)
++        switchMute = view.findViewById(R.id.switch_mute)
++        switchAngle = view.findViewById(R.id.switch_angle)
++
++        switchSuppress.isChecked = gameModeController.shouldSuppressHeadsUp(packageName)
++        switchMute.isChecked = gameModeController.shouldMute(packageName)
++        switchAngle.isChecked = gameModeController.shouldUseAngle(packageName)
++
++        // Tapping anywhere on a row flips its switch.
++        view.findViewById<View>(R.id.row_suppress).setOnClickListener { switchSuppress.toggle() }
++        view.findViewById<View>(R.id.row_mute).setOnClickListener { switchMute.toggle() }
++        view.findViewById<View>(R.id.row_angle).setOnClickListener { switchAngle.toggle() }
++
++        view.findViewById<View>(R.id.button_save).setOnClickListener { save() }
++        view.findViewById<View>(R.id.button_back).setOnClickListener { close() }
++    }
++
++    private fun bindHeader(view: View) {
++        val pm = requireContext().packageManager
++        val icon = view.findViewById<ImageView>(R.id.app_icon)
++        val name = view.findViewById<TextView>(R.id.app_name)
++        view.findViewById<TextView>(R.id.app_package).text = packageName
++        runCatching {
++                val info = pm.getApplicationInfo(packageName, 0)
++                icon.setImageDrawable(pm.getApplicationIcon(info))
++                name.text = pm.getApplicationLabel(info)
++            }
++            .onFailure { name.text = packageName }
++    }
++
++    private fun bindGameMode(view: View) {
++        modeGroup = view.findViewById(R.id.mode_group)
++        val gameManager = requireContext().getSystemService(GameManager::class.java)
++        val mode = runCatching { gameManager?.getGameMode(packageName) }.getOrNull()
++        val checkedButton =
++            when (mode) {
++                GameManager.GAME_MODE_PERFORMANCE -> R.id.mode_performance
++                GameManager.GAME_MODE_BATTERY -> R.id.mode_battery
++                else -> R.id.mode_standard
++            }
++        modeGroup.check(checkedButton)
++    }
++
++    private fun selectedMode(): Int =
++        when (modeGroup.checkedButtonId) {
++            R.id.mode_performance -> GameManager.GAME_MODE_PERFORMANCE
++            R.id.mode_battery -> GameManager.GAME_MODE_BATTERY
++            else -> GameManager.GAME_MODE_STANDARD
++        }
++
++    /**
++     * Applies the selected game mode through the system game manager.
++     *
++     * The service supplies its own resolution scaling when the game declares no configuration of
++     * its own, so setting the mode is enough here.
++     *
++     * The service only accepts modes for packages it already knows as games, and it learns that
++     * from a content observer on our own list, so a freshly marked game needs a couple of
++     * retries before setGameMode() stops being a silent no-op.
++     */
++    private fun applyGameMode(mode: Int) {
++        val appContext = requireContext().applicationContext
++        val userId = UserHandle.myUserId()
++        val handler = Handler(Looper.getMainLooper())
++        var attempts = 0
++
++        val attempt =
++            object : Runnable {
++                override fun run() {
++                    runCatching {
++                            val service =
++                                IGameManagerService.Stub.asInterface(
++                                    ServiceManager.getService(Context.GAME_SERVICE)
++                                ) ?: return
++                            service.setGameMode(packageName, mode, userId)
++                        }
++                        .onFailure {
++                            Log.w(TAG, "Could not apply game mode $mode to $packageName", it)
++                        }
++
++                    val current =
++                        runCatching {
++                                appContext
++                                    .getSystemService(GameManager::class.java)
++                                    ?.getGameMode(packageName)
++                            }
++                            .getOrNull()
++                    if (current == mode) {
++                        return
++                    }
++                    if (++attempts < MAX_ATTEMPTS) {
++                        handler.postDelayed(this, RETRY_DELAY_MS)
++                    } else {
++                        Log.w(TAG, "Game mode $mode never stuck for $packageName")
++                    }
++                }
++            }
++        handler.post(attempt)
++    }
++
++    private fun save() {
++        // Saving marks the package as a game, the other settings describe its behaviour.
++        gameModeController.addGame(packageName)
++        gameModeController.setSuppressHeadsUp(packageName, switchSuppress.isChecked)
++        gameModeController.setMute(packageName, switchMute.isChecked)
++        gameModeController.setUseAngle(packageName, switchAngle.isChecked)
++        applyGameMode(selectedMode())
++        close()
++    }
++
++    override fun onDestroy() {
++        if (::gameModeController.isInitialized) {
++            gameModeController.destroy()
++        }
++        super.onDestroy()
++    }
++
++    private fun close() {
++        requireActivity().onBackPressedDispatcher.onBackPressed()
++    }
++
++    companion object {
++        private const val TAG = "GameAppSettings"
++
++        private const val MAX_ATTEMPTS = 5
++        private const val RETRY_DELAY_MS = 200L
++
++        const val ARG_PACKAGE = "package_name"
++
++        @JvmStatic
++        fun arguments(packageName: String) =
++            Bundle().apply { putString(ARG_PACKAGE, packageName) }
++    }
++}
+diff --git a/src/com/android/settings/game/GameModeSettings.kt b/src/com/android/settings/game/GameModeSettings.kt
+new file mode 100644
+index 0000000..afb2ab8
+--- /dev/null
++++ b/src/com/android/settings/game/GameModeSettings.kt
+@@ -0,0 +1,97 @@
++/*
++ * Copyright (C) 2026 The PixelOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.settings.game
++
++import android.app.AlertDialog
++import android.app.settings.SettingsEnums
++import android.os.Bundle
++import com.android.internal.util.GameModeController
++import com.android.settings.R
++import com.android.settings.core.BaseAppListSettingsFragment
++import com.android.settings.core.SubSettingLauncher
++
++/**
++ * Lets the user pick which packages are games. Tapping an app opens [GameAppSettings] where its
++ * game mode, notification and renderer behaviour is configured; long pressing one removes it
++ * from the list again.
++ */
++class GameModeSettings : BaseAppListSettingsFragment() {
++
++    private lateinit var gameModeController: GameModeController
++
++    // Toggling a game must not kill it, the user may be configuring while playing.
++    override val restartPackageOnChange = false
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++        gameModeController = GameModeController(requireContext())
++    }
++
++    override fun onResume() {
++        super.onResume()
++        // Coming back from the per game screen, the membership may have changed.
++        refreshAppList()
++    }
++
++    override fun onDestroy() {
++        gameModeController.destroy()
++        super.onDestroy()
++    }
++
++    override fun getTitleResId() = R.string.game_mode_settings_title
++
++    override fun getInitialCheckedList() = gameModeController.games.toList()
++
++    // Tapping opens the per game screen instead of toggling the entry.
++    override fun onItemClick(packageName: String): Boolean {
++        SubSettingLauncher(requireContext())
++            .setDestination(GameAppSettings::class.java.name)
++            .setArguments(GameAppSettings.arguments(packageName))
++            .setTitleText(appLabel(packageName))
++            .setSourceMetricsCategory(SettingsEnums.MANAGE_APPLICATIONS)
++            .launch()
++        return true
++    }
++
++    // Selection is driven by the per game screen, so the base toggle is unused here.
++    override fun onListUpdate(packageName: String, isChecked: Boolean) {}
++
++    override fun onItemLongClick(packageName: String): Boolean {
++        if (!gameModeController.isGame(packageName)) return false
++        AlertDialog.Builder(requireContext())
++            .setTitle(getString(R.string.game_mode_remove_title, appLabel(packageName)))
++            .setMessage(R.string.game_mode_remove_message)
++            .setPositiveButton(android.R.string.ok) { _, _ ->
++                gameModeController.removeGame(packageName)
++                refreshAppList()
++            }
++            .setNegativeButton(android.R.string.cancel, null)
++            .show()
++        return true
++    }
++
++    private fun appLabel(packageName: String): CharSequence =
++        runCatching {
++                val pm = requireContext().packageManager
++                pm.getApplicationLabel(pm.getApplicationInfo(packageName, 0))
++            }
++            .getOrDefault(packageName)
++
++    companion object {
++        private const val TAG = "GameModeSettings"
++    }
++}
+-- 
+2.53.0
+
