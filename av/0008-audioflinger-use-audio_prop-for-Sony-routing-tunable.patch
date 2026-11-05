@@ -1,0 +1,94 @@
+From e82992353d3eb5aeb44ced74b302a23416b81834 Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Thu, 5 Nov 2026 10:02:41 +0800
+Subject: [PATCH] audioflinger: use audio_prop for Sony routing tunables
+
+vendor.audio.invalidate_* falls back to vendor_default_prop, which
+audioserver cannot read, so every route update logged:
+
+  avc: denied { read } for name="u:object_r:vendor_default_prop:s0"
+  scontext=u:r:audioserver:s0
+
+Rename the tunables to persist.audio.invalidate_*, which are labelled
+audio_prop (audioserver already has get_prop). Defaults in code match
+the values previously set in audio.mk, so behaviour is unchanged.
+
+Change-Id: I1c5f8a3b7e2d9f4a6c0b5e8d1a3f7c2e9b4d6a05
+---
+ services/audioflinger/AudioFlinger.cpp          |  8 ++++----
+ services/audioflinger/SonyRoutingInvalidate.cpp | 10 +++++-----
+ 2 files changed, 9 insertions(+), 9 deletions(-)
+
+diff --git a/services/audioflinger/AudioFlinger.cpp b/services/audioflinger/AudioFlinger.cpp
+index f979117..c1d812a 100644
+--- a/services/audioflinger/AudioFlinger.cpp
++++ b/services/audioflinger/AudioFlinger.cpp
+@@ -1786,12 +1786,12 @@ bool sonyShouldScheduleMusicInvalidate(const char* keyValuePairs) {
+ 
+ int sonyInvalidateSleepBeforeUs(const char* keyValuePairs) {
+     if (keyValuePairs == nullptr) {
+-        return property_get_int32("vendor.audio.invalidate_sleep_before", 100000);
++        return property_get_int32("persist.audio.invalidate_sleep_before", 100000);
+     }
+     if (strstr(keyValuePairs, "dsee_hx_state=1") != nullptr) {
+-        return property_get_int32("vendor.audio.invalidate_sleep_dsee_on", 50000);
++        return property_get_int32("persist.audio.invalidate_sleep_dsee_on", 50000);
+     }
+-    return property_get_int32("vendor.audio.invalidate_sleep_before", 100000);
++    return property_get_int32("persist.audio.invalidate_sleep_before", 100000);
+ }
+ 
+ // daxService sets dle_ds_state on HAL; mirror into EffectDapController (cannot rely on
+@@ -2030,7 +2030,7 @@ status_t AudioFlinger::setParameters(audio_io_handle_t ioHandle, const String8&
+             ALOGI("%s: playing pkg change, schedule music invalidate", __func__);
+             scheduleSonyMusicRoutingInvalidate(
+                     this, false,
+-                    property_get_int32("vendor.audio.invalidate_sleep_before", 100000));
++                    property_get_int32("persist.audio.invalidate_sleep_before", 100000));
+         }
+         if (sonyRoutingChanged) {
+             sonyApplySonyRoutingHalState(filteredKeyValuePairs.c_str());
+diff --git a/services/audioflinger/SonyRoutingInvalidate.cpp b/services/audioflinger/SonyRoutingInvalidate.cpp
+index 76b8297..2925257 100644
+--- a/services/audioflinger/SonyRoutingInvalidate.cpp
++++ b/services/audioflinger/SonyRoutingInvalidate.cpp
+@@ -1,7 +1,7 @@
+ /*
+  * Stock libar-pal coalesces invalidate_out_track via a worker thread with
+- * vendor.audio.invalidate_sleep_{before,after,dsee_on} and
+- * vendor.audio.invalidate_skip to defer framework invalidate to HAL-only.
++ * persist.audio.invalidate_sleep_{before,after,dsee_on} and
++ * persist.audio.invalidate_skip to defer framework invalidate to HAL-only.
+  */
+ #define LOG_TAG "SonyRoutingInvalidate"
+ 
+@@ -39,7 +39,7 @@ int sonySleepUs(const char* prop, int defaultUs) {
+ }
+ 
+ bool sonyFrameworkInvalidateSkipped() {
+-    return property_get_bool("vendor.audio.invalidate_skip", false);
++    return property_get_bool("persist.audio.invalidate_skip", false);
+ }
+ 
+ void* workerEntry(void* /*arg*/) {
+@@ -67,7 +67,7 @@ void* workerEntry(void* /*arg*/) {
+ 
+         const int sleepBefore = sleepBeforeOverride >= 0
+                 ? sleepBeforeOverride
+-                : sonySleepUs("vendor.audio.invalidate_sleep_before", kDefaultSleepBeforeUs);
++                : sonySleepUs("persist.audio.invalidate_sleep_before", kDefaultSleepBeforeUs);
+         if (sleepBefore > 0) {
+             usleep(static_cast<useconds_t>(sleepBefore));
+         }
+@@ -85,7 +85,7 @@ void* workerEntry(void* /*arg*/) {
+         }
+ 
+         const int sleepAfter =
+-                sonySleepUs("vendor.audio.invalidate_sleep_after", kDefaultSleepAfterUs);
++                sonySleepUs("persist.audio.invalidate_sleep_after", kDefaultSleepAfterUs);
+         if (sleepAfter > 0 && gRequestId.load() == reqId) {
+             usleep(static_cast<useconds_t>(sleepAfter));
+         }
+-- 
+2.53.0
+

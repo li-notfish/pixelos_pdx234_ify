@@ -1,0 +1,60 @@
+From 418722ad71abf50ee535f8adc88c06c65d25743c Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Thu, 5 Nov 2026 09:54:22 +0800
+Subject: [PATCH] audioflinger: fix lock order in Sony routing invalidation
+
+EffectDapDmsClient::connect() runs from AudioFlinger::moveEffectChain_ll()
+with a ThreadBase_Mutex held. Its cached-state callback can detect a DSEE
+route change, and runAfterRoutingUpdate() then called
+invalidateMusicTracksOnAllPlaybackThreads(), which takes
+AudioFlinger_Mutex: rank 8 acquired while holding ThreadBase_Mutex rank
+13. audio_utils::mutex asserts and audioserver aborts:
+
+  pre_lock: invalid mutex order (previous) 13 ThreadBase_Mutex>
+  (new) 8 AudioFlinger_Mutex
+
+Defer the invalidation to scheduleSonyMusicRoutingInvalidate() so it runs
+on the worker thread with no audio locks held.
+
+Change-Id: I7b2e5d9a1c4f8e0b3d6a9c2f5e8b1d4a7c0f3e62
+---
+ services/audioflinger/EffectDapController.cpp | 21 ++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/services/audioflinger/EffectDapController.cpp b/services/audioflinger/EffectDapController.cpp
+index 26e71c2..32e04b6 100644
+--- a/services/audioflinger/EffectDapController.cpp
++++ b/services/audioflinger/EffectDapController.cpp
+@@ -719,13 +719,24 @@ void EffectDapController::finishRoutingUpdate_l(bool dolbyOn) {
+ }
+ 
+ void EffectDapController::runAfterRoutingUpdate() {
+-    if (!mInvalidateMusicAfterUnlock) {
+-        return;
++    bool pending = false;
++    {
++        Mutex::Autolock _l(mLock);
++        pending = mInvalidateMusicAfterUnlock;
++        mInvalidateMusicAfterUnlock = false;
+     }
+-    mInvalidateMusicAfterUnlock = false;
+-    if (mAudioFlinger != nullptr) {
+-        mAudioFlinger->invalidateMusicTracksOnAllPlaybackThreads();
++    if (!pending || mAudioFlinger == nullptr) {
++        return;
+     }
++    // Do not take AudioFlinger_Mutex here. This path runs from the DMS
++    // connect callback inside AudioFlinger::moveEffectChain_ll(), which
++    // holds a ThreadBase_Mutex: AudioFlinger_Mutex (rank 8) may not be
++    // acquired while ThreadBase_Mutex (rank 13) is held, otherwise
++    // audio_utils::mutex aborts audioserver with
++    //   "pre_lock: invalid mutex order ... ThreadBase_Mutex > AudioFlinger_Mutex".
++    // Hand the invalidation to the dedicated routing-invalidate worker.
++    scheduleSonyMusicRoutingInvalidate(mAudioFlinger, true /*invalidateAll*/,
++                                       -1 /*sleepBeforeUsOverride*/);
+ }
+ 
+ void EffectDapController::applyBypassState_l(bool dolbyOn) {
+-- 
+2.53.0
+

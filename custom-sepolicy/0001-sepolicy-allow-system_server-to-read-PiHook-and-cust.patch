@@ -1,0 +1,29 @@
+From e282dbbcd5b691f8cd576ed15389bd09952c2eef Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Thu, 5 Nov 2026 10:02:41 +0800
+Subject: [PATCH] sepolicy: allow system_server to read PiHook and custom
+ version props
+
+avc: denied { read } for name="u:object_r:pih_disable_prop:s0"
+  scontext=u:r:system_server:s0
+avc: denied { read } for name="u:object_r:custom_version_prop:s0"
+  scontext=u:r:system_server:s0
+Change-Id: Ic8179d44d34d2d21f1191e5610ab707fc35cc700
+---
+ private/system_server.te | 4 ++++
+ 1 file changed, 4 insertions(+)
+ create mode 100644 private/system_server.te
+
+diff --git a/private/system_server.te b/private/system_server.te
+new file mode 100644
+index 0000000..96201f4
+--- /dev/null
++++ b/private/system_server.te
+@@ -0,0 +1,4 @@
++# PiHook toggle (frameworks/base PiHook patch) and PixelOS build props
++# are read from system_server during boot.
++get_prop(system_server, pih_disable_prop)
++get_prop(system_server, custom_version_prop)
+-- 
+2.53.0
+

@@ -1,0 +1,27 @@
+From 6a2dc7d568ff08925dedaaab6aa482112acf0dac Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Thu, 5 Nov 2026 10:24:45 +0800
+Subject: [PATCH] sepolicy: allow shell to read the QEMU LCD density prop
+
+Reading all properties (getprop / aShell) logged:
+
+  avc: denied { read } ... tcontext=u:object_r:qemu_sf_lcd_density_prop:s0
+  scontext=u:r:shell:s0
+
+Change-Id: I6229883ee577d45d7b45df947455abbd25b29b2c
+---
+ private/shell.te | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/private/shell.te b/private/shell.te
+index 78a1dcd..cef67be 100644
+--- a/private/shell.te
++++ b/private/shell.te
+@@ -1,2 +1,4 @@
+ # Allow shell to disable PIHooks
+ set_prop(shell, pih_disable_prop)
++# Allow shell to read the QEMU LCD density prop (getprop / display tools)
++get_prop(shell, qemu_sf_lcd_density_prop)
+-- 
+2.53.0
+
