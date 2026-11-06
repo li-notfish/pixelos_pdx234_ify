@@ -1,0 +1,141 @@
+From f59281218a37ec3e6a436c2c6953dd9f502d7071 Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Thu, 5 Nov 2026 20:53:03 +0800
+Subject: [PATCH] audioflinger: defer Music Listener pregain restart to the mix
+ thread
+
+preparePregainForMusicListener() ran the whole DAP restart (stop, offload,
+configure, start) synchronously from createEffect_l(), i.e. on the binder
+thread that just created the Music Listener effect, while holding the mix
+thread's ThreadBase_Mutex and the output chain's EffectChain_Mutex.
+
+The order itself is legal (13 -> 15), but it blocks prepareTracks_l() for
+the duration of the restart and does the effect reconfiguration off the
+mixer thread; a slow DMS/binder round trip there shows up as
+
+  TimeCheck timeout for IAudioFlinger::setParameters
+
+and leaves the mixer's buffer providers churning across the restart.
+
+Queue it like the deferred path already does: remember the Music Listener
+thread and let runDeferredPregainPrep() hand it to
+runPendingDapPregainOnMixThread() at the top of the mix thread's loop.
+The volume resync still happens on the Music Listener thread through
+mPendingMlVolumeResync -> resyncActiveTrackEffectVolumes_l().
+
+runPregainPrepSync() and prepareDapPregainResyncVolumes() are unused now.
+
+Change-Id: If32349cf44772b661168ae7b39c3348fe8c1dc4b
+---
+ services/audioflinger/EffectDapController.cpp | 25 ++++++-------------
+ services/audioflinger/EffectDapController.h   |  2 --
+ services/audioflinger/IAfThread.h             |  1 -
+ services/audioflinger/Threads.cpp             |  5 ----
+ services/audioflinger/Threads.h               |  1 -
+ 5 files changed, 8 insertions(+), 26 deletions(-)
+
+diff --git a/services/audioflinger/EffectDapController.cpp b/services/audioflinger/EffectDapController.cpp
+index 32e04b6..aa969f0 100644
+--- a/services/audioflinger/EffectDapController.cpp
++++ b/services/audioflinger/EffectDapController.cpp
+@@ -429,15 +429,6 @@ void EffectDapController::executePregainPrep_l(const sp<IAfPlaybackThread>& mlTh
+     ALOGV("%s() scheduled on mix io=%d", __func__, dapThread->id());
+ }
+ 
+-void EffectDapController::runPregainPrepSync(const sp<IAfPlaybackThread>& mlThread,
+-        const sp<IAfPlaybackThread>& dapThread) {
+-    dapThread->prepareDapPregainForTrackThread(mlThread);
+-    if (mlThread != nullptr) {
+-        mlThread->prepareDapPregainResyncVolumes();
+-        ALOGI("%s() mix io=%d track io=%d", __func__, dapThread->id(), mlThread->id());
+-    }
+-}
+-
+ void EffectDapController::onDapPregPrepComplete_l() {
+     sp<IAfPlaybackThread> mlThread = mPendingMlForResync.promote();
+     if (mlThread == nullptr) {
+@@ -468,20 +459,20 @@ void EffectDapController::preparePregainForMusicListener(
+     if (mlThread == nullptr) {
+         return;
+     }
+-    sp<IAfPlaybackThread> dapThread;
+     {
+         Mutex::Autolock _l(mLock);
+-        dapThread = mDapPlaybackThread.promote();
+-        if (dapThread == nullptr || mDapEffect == nullptr) {
+-            mPendingMlPregPrep = mlThread;
++        mPendingMlPregPrep = mlThread;
++        if (mDapPlaybackThread.promote() == nullptr || mDapEffect == nullptr) {
+             ALOGI("%s() deferred until global DAP bound", __func__);
+             return;
+         }
+     }
+-    if (!requestPregainPrep()) {
+-        return;
+-    }
+-    runPregainPrepSync(mlThread, dapThread);
++    // Do not restart the DAP here: this runs on the binder thread that just
++    // created the Music Listener effect. The restart takes ThreadBase_Mutex (13)
++    // and then EffectChain_Mutex (15) on the mix thread, which stalls
++    // prepareTracks_l() and can trip the setParameters TimeCheck. Let the mix
++    // thread run it at the top of its loop, where no lock is held.
++    runDeferredPregainPrep();
+ }
+ 
+ void EffectDapController::runDeferredPregainPrep() {
+diff --git a/services/audioflinger/EffectDapController.h b/services/audioflinger/EffectDapController.h
+index fec36e0..9fccb48 100644
+--- a/services/audioflinger/EffectDapController.h
++++ b/services/audioflinger/EffectDapController.h
+@@ -73,8 +73,6 @@ private:
+     void runAfterRoutingUpdate();
+     void finishDapRestartForPregain_l();
+     void executePregainPrep_l(const sp<IAfPlaybackThread>& mlThread);
+-    void runPregainPrepSync(const sp<IAfPlaybackThread>& mlThread,
+-                             const sp<IAfPlaybackThread>& dapThread);
+     void runDeferredPregainPrep();
+     bool consumePendingDapPregPrep_l(const sp<IAfPlaybackThread>& thread);
+     void onDapPregPrepComplete_l();
+diff --git a/services/audioflinger/IAfThread.h b/services/audioflinger/IAfThread.h
+index 868501c..9cce19c 100644
+--- a/services/audioflinger/IAfThread.h
++++ b/services/audioflinger/IAfThread.h
+@@ -534,7 +534,6 @@ public:
+     virtual void resyncActiveTrackEffectVolumes_l() REQUIRES(mutex()) = 0;
+     virtual void prepareDapPregainForTrackThread(const sp<IAfPlaybackThread>& /*trackThread*/)
+             EXCLUDES(mutex()) {}
+-    virtual void prepareDapPregainResyncVolumes() EXCLUDES(mutex()) {}
+     virtual bool invalidateMusicTracks() EXCLUDES(mutex()) { return false; }
+ 
+     // a very large number of suspend() will eventually wraparound, but unlikely
+diff --git a/services/audioflinger/Threads.cpp b/services/audioflinger/Threads.cpp
+index 306e083..5dafbd3 100644
+--- a/services/audioflinger/Threads.cpp
++++ b/services/audioflinger/Threads.cpp
+@@ -6589,11 +6589,6 @@ void PlaybackThread::prepareDapPregainForTrackThread(
+     ALOGV("%s() track io=%d mix io=%d", __func__, ioThread->id(), id());
+ }
+ 
+-void PlaybackThread::prepareDapPregainResyncVolumes() {
+-    audio_utils::lock_guard _l(mutex());
+-    resyncActiveTrackEffectVolumes_l();
+-}
+-
+ void PlaybackThread::resyncActiveTrackEffectVolumes_l() {
+     const float scaleTo8_24 =
+             static_cast<float>(MAX_GAIN_INT) * static_cast<float>(MAX_GAIN_INT);
+diff --git a/services/audioflinger/Threads.h b/services/audioflinger/Threads.h
+index 1f6b79e..570193c 100644
+--- a/services/audioflinger/Threads.h
++++ b/services/audioflinger/Threads.h
+@@ -1135,7 +1135,6 @@ public:
+     void resyncActiveTrackEffectVolumes_l() final REQUIRES(mutex());
+     void prepareDapPregainForTrackThread(const sp<IAfPlaybackThread>& trackThread) final
+             EXCLUDES(mutex());
+-    void prepareDapPregainResyncVolumes() final EXCLUDES(mutex());
+ 
+ protected:
+     // Code snippets that were lifted up out of threadLoop()
+-- 
+2.53.0
+

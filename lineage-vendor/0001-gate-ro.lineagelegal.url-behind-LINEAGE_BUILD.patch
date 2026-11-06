@@ -1,0 +1,15 @@
+diff --git a/config/common_mobile.mk b/config/common_mobile.mk
+index 5c9ccfa..fead23e 100644
+--- a/config/common_mobile.mk
++++ b/config/common_mobile.mk
+@@ -63,8 +63,10 @@ PRODUCT_COPY_FILES += \
+     frameworks/native/data/etc/android.software.freeform_window_management.xml:$(TARGET_COPY_OUT_PRODUCT)/etc/permissions/android.software.freeform_window_management.xml
+ 
+ # Legal
++ifeq ($(LINEAGE_BUILD),true)
+ PRODUCT_PRODUCT_PROPERTIES += \
+     ro.lineagelegal.url=https://lineageos.org/legal
++endif
+ 
+ # Media
+ PRODUCT_PRODUCT_PROPERTIES += \

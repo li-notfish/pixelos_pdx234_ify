@@ -1,0 +1,63 @@
+From e178bf061bf7180bafdf748d3e974a43343551a9 Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Thu, 5 Nov 2026 20:44:07 +0800
+Subject: [PATCH] audioflinger: run DAP pregain before effect chain locks
+
+PlaybackThread::threadLoop() called runPendingDapPregainOnMixThread() after
+lockEffectChains_l() had already locked every effect chain. The pregain
+path then takes ThreadBase_Mutex (rank 13) while holding EffectChain_Mutex
+(rank 15), which audio_utils::mutex rejects:
+
+  pre_lock: invalid mutex order (previous) 15 EffectChain_Mutex>
+  (new) 13 ThreadBase_Mutex
+
+  PlaybackThread::prepareDapPregainForTrackThread()
+    <- EffectDapController::runPendingDapPregainOnMixThread()
+    <- PlaybackThread::threadLoop()
+
+Move the call to the top of the loop iteration, before any lock is taken,
+so the order stays 13 -> 15. It also avoids re-locking the output-mix chain
+that lockEffectChains_l() already holds.
+
+Change-Id: I0e2cb6826128bfcb9bbf03cd9db782662f872e3e
+---
+ services/audioflinger/Threads.cpp | 16 +++++++++-------
+ 1 file changed, 9 insertions(+), 7 deletions(-)
+
+diff --git a/services/audioflinger/Threads.cpp b/services/audioflinger/Threads.cpp
+index dc531a2..306e083 100644
+--- a/services/audioflinger/Threads.cpp
++++ b/services/audioflinger/Threads.cpp
+@@ -4149,6 +4149,15 @@ NO_THREAD_SAFETY_ANALYSIS  // manual locking of AudioFlinger
+     {
+         cpuStats.sample(myName);
+ 
++        // DAP pregain restart takes ThreadBase_Mutex (rank 13) and then the effect
++        // chain mutex (rank 15). It must run before lockEffectChains_l() grabs the
++        // chain locks for this iteration: doing it afterwards inverts the order
++        // (15 -> 13) and audio_utils::mutex aborts audioserver with
++        //   pre_lock: invalid mutex order ... EffectChain_Mutex > ThreadBase_Mutex.
++        if (EffectDapController* ctrl = EffectDapController::instance(); ctrl != nullptr) {
++            ctrl->runPendingDapPregainOnMixThread(asIAfPlaybackThread());
++        }
++
+         std::vector<sp<IAfEffectChain>> effectChains;
+         audio_session_t activeHapticSessionId = AUDIO_SESSION_NONE;
+         bool isHapticSessionSpatialized = false;
+@@ -4364,13 +4373,6 @@ NO_THREAD_SAFETY_ANALYSIS  // manual locking of AudioFlinger
+             }
+         } // mutex() scope ends
+ 
+-        // DAP pregain restart must run after prepareTracks_l() releases mutex():
+-        // prepareDapPregainForTrackThread() locks PlaybackThread::mutex(); calling it from
+-        // inside prepareTracks_l() deadlocks (recursive ThreadBase_Mutex abort).
+-        if (EffectDapController* ctrl = EffectDapController::instance(); ctrl != nullptr) {
+-            ctrl->runPendingDapPregainOnMixThread(asIAfPlaybackThread());
+-        }
+-
+         if (mBytesRemaining == 0) {
+             mCurrentWriteLength = 0;
+             if (mMixerStatus == MIXER_TRACKS_READY) {
+-- 
+2.53.0
+
