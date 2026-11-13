@@ -1,0 +1,912 @@
+From f80ef118ccacde6be891bdaa354f6a32212dc009 Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Thu, 12 Nov 2026 16:56:41 +0800
+Subject: [PATCH 1/2] audioflinger: keep all daxService HIDL traffic off the
+ audio locks
+
+EffectDapDmsClient::connect() (tryGetService, linkToDeath, registerClient and
+three getIntParam calls) and disconnect() (unregisterClient) ran synchronously
+from callers that hold AudioFlinger_Mutex/ThreadBase_Mutex/EffectChain_Mutex:
+createEffect() and moveEffectChain_ll() both call onGlobalMixChainAttached()
+inside their lock scopes, and EffectChain::removeEffect() calls effectReleased()
+with the chain lock held. A slow or restarting daxService therefore stalled the
+whole audio framework.
+
+- Run every DMS connect/disconnect on a private worker thread; callers only
+  queue a request.
+- Fix the controller/DMS lock inversion: the Dolby state callback used to run
+  inside EffectDapDmsClient::mLock while taking the controller lock, while
+  effectReleased() took the controller lock and then the DMS lock.
+- Reconnect when the DMS service dies, with 1s backoff capped at 30 attempts,
+  instead of staying disconnected until the DAP effect is recreated.
+- Routing-invalidate worker: make the AudioFlinger pointer atomic, start the
+  thread joinable, interrupt the sleeps with a timed cond wait, and join before
+  AudioFlinger is destroyed.
+- Join the property watcher in destroy() and detach the HIDL callbacks before
+  the controller is deleted.
+- Query the isUpmixSupportedPkg HAL value only when the playing package changes.
+- Skip mLock in runPendingDapPregainOnMixThread() unless a restart was queued.
+- Make EffectModule::mSkipEffectProcess atomic (written by binder threads, read
+  by the mixer thread) and stop logging the arbitration result when it did not
+  change. Negative-cache the app whitelist XML read.
+
+Change-Id: Ie44e00b676ffc6420ead174d7a8fa73a509aed2d
+---
+ services/audioflinger/AudioFlinger.cpp        |   2 +-
+ services/audioflinger/EffectDapController.cpp | 213 ++++++++++++++++--
+ services/audioflinger/EffectDapController.h   |  39 ++++
+ services/audioflinger/EffectDapDmsClient.cpp  | 153 ++++++++-----
+ services/audioflinger/EffectDapDmsClient.h    |   8 +-
+ services/audioflinger/Effects.h               |   5 +-
+ .../audioflinger/SonyEffectPriorityApps.cpp   |   7 +
+ .../audioflinger/SonyRoutingInvalidate.cpp    |  76 +++++--
+ 8 files changed, 407 insertions(+), 96 deletions(-)
+
+diff --git a/services/audioflinger/AudioFlinger.cpp b/services/audioflinger/AudioFlinger.cpp
+index c1d812a..9d7db7b 100644
+--- a/services/audioflinger/AudioFlinger.cpp
++++ b/services/audioflinger/AudioFlinger.cpp
+@@ -1912,7 +1912,7 @@ status_t AudioFlinger::setParameters(audio_io_handle_t ioHandle, const String8&
+             ioHandle, keyValuePairs.c_str(),
+             IPCThreadState::self()->getCallingPid(), IPCThreadState::self()->getCallingUid());
+     if (isSonyEffectRoutingParameter(keyValuePairs.c_str())) {
+-        ALOGI("setParameters(sony) io=%d uid=%d kv=%s", ioHandle,
++        ALOGV("setParameters(sony) io=%d uid=%d kv=%s", ioHandle,
+               IPCThreadState::self()->getCallingUid(), keyValuePairs.c_str());
+     }
+ 
+diff --git a/services/audioflinger/EffectDapController.cpp b/services/audioflinger/EffectDapController.cpp
+index 12c0bca..0fef20d 100644
+--- a/services/audioflinger/EffectDapController.cpp
++++ b/services/audioflinger/EffectDapController.cpp
+@@ -117,7 +117,15 @@ EffectDapController::EffectDapController() {
+             },
+             [this](bool dolbyOn) {
+                 updateBypassFromDolbyHalState(dolbyOn);
++            },
++            [this]() {
++                onDmsServiceDied();
+             });
++    startDmsWorker();
++}
++
++EffectDapController::~EffectDapController() {
++    stopDmsWorker();
+ }
+ 
+ void EffectDapController::onAudioFlingerReady() {
+@@ -132,8 +140,9 @@ void EffectDapController::onAudioFlingerReady() {
+ void EffectDapController::destroy() {
+     if (sInstance != nullptr) {
+         sInstance->stopPropertyWatcher();
++        sInstance->stopDmsWorker();
+         if (sInstance->mDmsClient != nullptr) {
+-            sInstance->mDmsClient->disconnect();
++            sInstance->mDmsClient->detach();
+         }
+     }
+     shutdownSonyMusicRoutingInvalidate();
+@@ -141,19 +150,138 @@ void EffectDapController::destroy() {
+     sInstance = nullptr;
+ }
+ 
++void EffectDapController::startDmsWorker() {
++    std::lock_guard<std::mutex> lock(mDmsMutex);
++    if (mDmsWorkerRunning) {
++        return;
++    }
++    mDmsWorkerRunning = true;
++    mDmsThread = std::thread([this] { dmsWorkerLoop(); });
++}
++
++void EffectDapController::stopDmsWorker() {
++    {
++        std::lock_guard<std::mutex> lock(mDmsMutex);
++        if (!mDmsWorkerRunning) {
++            return;
++        }
++        mDmsWorkerRunning = false;
++    }
++    mDmsCond.notify_all();
++    if (mDmsThread.joinable()) {
++        mDmsThread.join();
++    }
++}
++
++void EffectDapController::requestDmsConnect(audio_session_t sessionId,
++                                            audio_io_handle_t ioHandle) {
++    {
++        std::lock_guard<std::mutex> lock(mDmsMutex);
++        mDmsRequest = DmsRequest::Connect;
++        mDmsRequestSession = sessionId;
++        mDmsRequestIo = ioHandle;
++        mDmsRetryCount = 0;
++    }
++    mDmsCond.notify_one();
++}
++
++void EffectDapController::requestDmsDisconnect() {
++    {
++        std::lock_guard<std::mutex> lock(mDmsMutex);
++        mDmsRequest = DmsRequest::Disconnect;
++        mDmsRetryCount = 0;
++    }
++    mDmsCond.notify_one();
++}
++
++void EffectDapController::onDmsServiceDied() {
++    ALOGW("%s: re-queueing DMS connection", __func__);
++    audio_session_t sessionId = AUDIO_SESSION_NONE;
++    audio_io_handle_t ioHandle = AUDIO_IO_HANDLE_NONE;
++    {
++        Mutex::Autolock _l(mLock);
++        if (mDapEffect == nullptr) {
++            return;
++        }
++        sessionId = mDapEffect->sessionId();
++        sp<IAfPlaybackThread> thread = mDapPlaybackThread.promote();
++        if (thread != nullptr) {
++            ioHandle = thread->id();
++        }
++    }
++    if (ioHandle == AUDIO_IO_HANDLE_NONE) {
++        return;
++    }
++    requestDmsConnect(sessionId, ioHandle);
++}
++
++void EffectDapController::dmsWorkerLoop() {
++    constexpr int kMaxRetries = 30;
++    std::unique_lock<std::mutex> lock(mDmsMutex);
++    while (mDmsWorkerRunning) {
++        mDmsCond.wait(lock, [this] {
++            return !mDmsWorkerRunning || mDmsRequest != DmsRequest::None;
++        });
++        if (!mDmsWorkerRunning) {
++            break;
++        }
++        const DmsRequest request = mDmsRequest;
++        const audio_session_t sessionId = mDmsRequestSession;
++        const audio_io_handle_t ioHandle = mDmsRequestIo;
++        mDmsRequest = DmsRequest::None;
++        lock.unlock();
++
++        bool retry = false;
++        if (mDmsClient != nullptr) {
++            if (request == DmsRequest::Connect) {
++                const status_t status = mDmsClient->connect(sessionId, ioHandle);
++                retry = (status != NO_ERROR);
++                if (retry) {
++                    ALOGW("%s: DMS connect failed: %d", __func__, status);
++                }
++            } else if (request == DmsRequest::Disconnect) {
++                mDmsClient->disconnect();
++            }
++        }
++
++        lock.lock();
++        if (retry && mDmsWorkerRunning && mDmsRequest == DmsRequest::None) {
++            if (++mDmsRetryCount > kMaxRetries) {
++                ALOGE("%s: giving up DMS reconnect after %d attempts", __func__, kMaxRetries);
++                mDmsRetryCount = 0;
++            } else {
++                // daxService may still be restarting: re-arm and back off.
++                mDmsRequest = DmsRequest::Connect;
++                mDmsRequestSession = sessionId;
++                mDmsRequestIo = ioHandle;
++                mDmsCond.wait_for(lock, std::chrono::seconds(1));
++            }
++        } else if (!retry) {
++            mDmsRetryCount = 0;
++        }
++    }
++}
++
+ void EffectDapController::startPropertyWatcher() {
+     if (mPropWatchRunning.exchange(true)) {
+         return;
+     }
+     pthread_attr_t attr;
+     pthread_attr_init(&attr);
+-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++    // Joinable: stopPropertyWatcher() must wait for the loop to leave the
++    // controller before it is deleted.
+     pthread_create(&mPropWatchThread, &attr, dolbyPropertyWatchEntry, nullptr);
+     pthread_attr_destroy(&attr);
++    mPropWatchThreadValid = true;
+ }
+ 
+ void EffectDapController::stopPropertyWatcher() {
+     mPropWatchRunning.store(false);
++    if (mPropWatchThreadValid) {
++        // __system_property_wait() blocks for at most 1s.
++        pthread_join(mPropWatchThread, nullptr);
++        mPropWatchThreadValid = false;
++    }
+ }
+ 
+ bool EffectDapController::propertyWatcherRunning() const {
+@@ -288,11 +416,18 @@ void EffectDapController::updateEffectPriority_l() {
+ 
+     const char* dapStatus = dapSkip ? "dolby non-Prioritized" : "dolby Prioritized";
+     const char* upmixStatus = upmixSkip ? "upmix non-Prioritized" : "upmix Prioritized";
+-  const char* pkgStatus = mUpmixSupportedPkg ? "Upmix Supported Pkg" : "Upmix non-Supported Pkg";
+-    ALOGI("%s() mode=%d dolby=%d dsee=%d 360ra=%d upmixPkg=%d uid=%u -> %s / %s (%s)",
+-          __func__, mUpmixHeadphoneMode, dolbyActive ? 1 : 0, mDseeHalOn ? 1 : 0,
+-          native360 ? 1 : 0, mUpmixSupportedPkg ? 1 : 0, mPlayingPkgUid, dapStatus,
+-          upmixStatus, pkgStatus);
++    const char* pkgStatus = mUpmixSupportedPkg ? "Upmix Supported Pkg" : "Upmix non-Supported Pkg";
++    if (!mLastPriorityValid || mLastDapSkip != dapSkip || mLastUpmixSkip != upmixSkip ||
++            mLastUpmixSupportedPkg != mUpmixSupportedPkg) {
++        mLastPriorityValid = true;
++        mLastDapSkip = dapSkip;
++        mLastUpmixSkip = upmixSkip;
++        mLastUpmixSupportedPkg = mUpmixSupportedPkg;
++        ALOGI("%s() mode=%d dolby=%d dsee=%d 360ra=%d upmixPkg=%d uid=%u -> %s / %s (%s)",
++              __func__, mUpmixHeadphoneMode, dolbyActive ? 1 : 0, mDseeHalOn ? 1 : 0,
++              native360 ? 1 : 0, mUpmixSupportedPkg ? 1 : 0, mPlayingPkgUid, dapStatus,
++              upmixStatus, pkgStatus);
++    }
+ }
+ 
+ void EffectDapController::onUpmixHeadphoneMode(int mode) {
+@@ -321,6 +456,10 @@ void EffectDapController::on360RaContents(bool active) {
+ 
+ void EffectDapController::onUpmixPlayingPkg(uid_t uid, const char* packageName) {
+     bool prioritized;
++    bool cached = false;
++    bool supported = false;
++    uid_t queryUid = static_cast<uid_t>(-1);
++    std::string queryPkg;
+     {
+         Mutex::Autolock _l(mLock);
+         mPlayingPkgUid = uid;
+@@ -333,10 +472,25 @@ void EffectDapController::onUpmixPlayingPkg(uid_t uid, const char* packageName)
+         }
+         prioritized = isPkgPrioritized(mPlayingPkgName, mPlayingPkgUid,
+                                        mPrioritizedApps, mExcludedApps);
++        if (!prioritized && mUpmixQueryValid && mUpmixQueryUid == mPlayingPkgUid &&
++                mUpmixQueryPkg == mPlayingPkgName) {
++            supported = mUpmixQueryResult;
++            cached = true;
++        }
++        queryUid = mPlayingPkgUid;
++        queryPkg = mPlayingPkgName;
++    }
++    supported = prioritized;
++    if (!prioritized && !cached) {
++        // HAL query and the package-manager lookup run outside mLock, see
++        // queryUpmixSupportedPkg().
++        supported = queryUpmixSupportedPkg(false);
++        Mutex::Autolock _l(mLock);
++        mUpmixQueryUid = queryUid;
++        mUpmixQueryPkg = queryPkg;
++        mUpmixQueryValid = true;
++        mUpmixQueryResult = supported;
+     }
+-    // HAL query and the package-manager lookup run outside mLock, see
+-    // queryUpmixSupportedPkg().
+-    const bool supported = queryUpmixSupportedPkg(prioritized);
+     char value[PROPERTY_VALUE_MAX] = {};
+     property_get(kDolbyEnabledProp, value, "0");
+     {
+@@ -464,6 +618,7 @@ void EffectDapController::executePregainPrep_l(const sp<IAfPlaybackThread>& mlTh
+     if (mlThread != nullptr) {
+         mPendingMlForResync = mlThread;
+     }
++    mDapPregPrepPending.store(true, std::memory_order_release);
+     ALOGV("%s() scheduled on mix io=%d", __func__, dapThread->id());
+ }
+ 
+@@ -478,12 +633,18 @@ void EffectDapController::onDapPregPrepComplete_l() {
+ 
+ bool EffectDapController::runPendingDapPregainOnMixThread(
+         const sp<IAfPlaybackThread>& mixThread) {
++    // Called on every playback thread iteration: avoid touching mLock unless a
++    // restart was actually requested.
++    if (!mDapPregPrepPending.load(std::memory_order_acquire)) {
++        return false;
++    }
+     sp<IAfPlaybackThread> trackThread;
+     {
+         Mutex::Autolock _l(mLock);
+         if (!consumePendingDapPregPrep_l(mixThread)) {
+             return false;
+         }
++        mDapPregPrepPending.store(false, std::memory_order_release);
+         trackThread = mPendingMlForResync.promote();
+     }
+     mixThread->prepareDapPregainForTrackThread(trackThread);
+@@ -656,16 +817,24 @@ void EffectDapController::effectReleased(const sp<IAfEffectModule>& effect) {
+     if (!isDapEffect(effect)) {
+         return;
+     }
+-    Mutex::Autolock _l(mLock);
+-    if (mDapEffect == effect) {
+-        mDapEffect.clear();
+-        mDapPlaybackThread.clear();
+-        mBypassed = true;
+-        if (mDmsClient != nullptr) {
+-            mDmsClient->disconnect();
++    bool disconnectDms = false;
++    {
++        Mutex::Autolock _l(mLock);
++        if (mDapEffect == effect) {
++            mDapEffect.clear();
++            mDapPlaybackThread.clear();
++            mPendingDapPregPrep.clear();
++            mDapPregPrepPending.store(false, std::memory_order_release);
++            mBypassed = true;
++            disconnectDms = true;
+         }
++        ALOGD("%s() DAP effect released %p", __func__, effect.get());
++    }
++    // unregisterClient() is a synchronous HIDL call: keep it off the controller
++    // lock and off the EffectChain lock held by the caller.
++    if (disconnectDms) {
++        requestDmsDisconnect();
+     }
+-    ALOGD("%s() DAP effect released %p", __func__, effect.get());
+ }
+ 
+ void EffectDapController::effectSuspended(const sp<IAfEffectBase>& effect, bool suspended) {
+@@ -822,10 +991,10 @@ void EffectDapController::connectDmsIfNeeded(const sp<IAfThreadBase>& thread) {
+     if (ioHandle == AUDIO_IO_HANDLE_NONE) {
+         return;
+     }
+-    const status_t status = mDmsClient->connect(sessionId, ioHandle);
+-    if (status != NO_ERROR) {
+-        ALOGW("%s() DMS connect failed: %d", __func__, status);
+-    }
++    // Never connect from here: callers hold AudioFlinger_Mutex/ThreadBase_Mutex
++    // (createEffect, moveEffectChain_ll) and connect() is a synchronous HIDL
++    // round trip to daxService.
++    requestDmsConnect(sessionId, ioHandle);
+ }
+ 
+ void EffectDapController::applyDapParamUpdate_l(const std::vector<uint8_t>& params) {
+diff --git a/services/audioflinger/EffectDapController.h b/services/audioflinger/EffectDapController.h
+index 3c5169c..0e47d00 100644
+--- a/services/audioflinger/EffectDapController.h
++++ b/services/audioflinger/EffectDapController.h
+@@ -7,8 +7,12 @@
+ #include <utils/Mutex.h>
+ 
+ #include <atomic>
++#include <chrono>
++#include <condition_variable>
+ #include <memory>
++#include <mutex>
+ #include <string>
++#include <thread>
+ #include <vector>
+ 
+ #include "IAfEffect.h"
+@@ -59,6 +63,7 @@ public:
+ 
+ private:
+     EffectDapController();
++    ~EffectDapController();
+ 
+     static bool isDapEffect(const sp<IAfEffectBase>& effect);
+     static bool isUpmixEffect(const sp<IAfEffectBase>& effect);
+@@ -82,6 +87,17 @@ private:
+     void connectDmsIfNeeded(const sp<IAfThreadBase>& thread);
+     void applyDapParamUpdate_l(const std::vector<uint8_t>& params);
+ 
++    // All DMS HIDL traffic runs on a private worker thread: connecting or
++    // disconnecting from under AudioFlinger/EffectChain/controller locks means
++    // holding those locks across a binder round trip to daxService.
++    enum class DmsRequest { None, Connect, Disconnect };
++    void startDmsWorker();
++    void stopDmsWorker();
++    void dmsWorkerLoop();
++    void requestDmsConnect(audio_session_t sessionId, audio_io_handle_t ioHandle);
++    void requestDmsDisconnect();
++    void onDmsServiceDied();
++
+     static EffectDapController* sInstance;
+ 
+     AudioFlinger* mAudioFlinger = nullptr;
+@@ -95,6 +111,11 @@ private:
+     bool mUpmixSupportedPkg = false;
+     uid_t mPlayingPkgUid = static_cast<uid_t>(-1);
+     std::string mPlayingPkgName;
++    // Last isUpmixSupportedPkg HAL answer and the package it was queried for.
++    uid_t mUpmixQueryUid = static_cast<uid_t>(-1);
++    std::string mUpmixQueryPkg;
++    bool mUpmixQueryValid = false;
++    bool mUpmixQueryResult = false;
+     std::vector<std::string> mPrioritizedApps;
+     std::vector<std::string> mExcludedApps;
+     wp<IAfPlaybackThread> mDapPlaybackThread;
+@@ -103,6 +124,9 @@ private:
+     std::atomic<const void*> mPendingMlVolumeResyncThread{nullptr};
+     wp<IAfPlaybackThread> mPendingMlPregPrep;
+     wp<IAfPlaybackThread> mPendingDapPregPrep;
++    // Checked by runPendingDapPregainOnMixThread() on literally every mix cycle:
++    // keep the common "nothing pending" case lock-free.
++    std::atomic<bool> mDapPregPrepPending{false};
+     wp<IAfPlaybackThread> mPendingMlForResync;
+     mutable Mutex mLock;
+     bool mBypassed = true;
+@@ -112,10 +136,25 @@ private:
+     bool mEffectiveDseeRoute = false;
+     bool mEffectiveRoutingInitialized = false;
+     bool mInvalidateMusicAfterUnlock = false;
++    // Log only when the effect arbitration result actually changes.
++    bool mLastPriorityValid = false;
++    bool mLastDapSkip = false;
++    bool mLastUpmixSkip = false;
++    bool mLastUpmixSupportedPkg = false;
+     nsecs_t mLastPregPrepNs = 0;
+ 
+     std::atomic<bool> mPropWatchRunning{false};
+     pthread_t mPropWatchThread{};
++    bool mPropWatchThreadValid = false;
++
++    std::thread mDmsThread;
++    std::mutex mDmsMutex;
++    std::condition_variable mDmsCond;
++    bool mDmsWorkerRunning = false;
++    DmsRequest mDmsRequest = DmsRequest::None;
++    audio_session_t mDmsRequestSession = AUDIO_SESSION_NONE;
++    audio_io_handle_t mDmsRequestIo = AUDIO_IO_HANDLE_NONE;
++    int mDmsRetryCount = 0;
+ };
+ 
+ } // namespace android
+diff --git a/services/audioflinger/EffectDapDmsClient.cpp b/services/audioflinger/EffectDapDmsClient.cpp
+index 3573f37..13dd472 100644
+--- a/services/audioflinger/EffectDapDmsClient.cpp
++++ b/services/audioflinger/EffectDapDmsClient.cpp
+@@ -47,6 +47,8 @@ struct EffectDapDmsClient::HidlState {
+             return Void();
+         }
+ 
++        void detach() { mOwner = nullptr; }
++
+     private:
+         EffectDapDmsClient* mOwner;
+     };
+@@ -63,6 +65,8 @@ struct EffectDapDmsClient::HidlState {
+             }
+         }
+ 
++        void detach() { mOwner = nullptr; }
++
+     private:
+         EffectDapDmsClient* mOwner;
+     };
+@@ -76,45 +80,62 @@ EffectDapDmsClient::EffectDapDmsClient() = default;
+ 
+ EffectDapDmsClient::~EffectDapDmsClient() {
+     disconnect();
++    if (mHidl != nullptr) {
++        if (mHidl->callbacks != nullptr) mHidl->callbacks->detach();
++        if (mHidl->deathRecipient != nullptr) mHidl->deathRecipient->detach();
++    }
+ }
+ 
+-void EffectDapDmsClient::setCallbacks(ParamUpdateFn onParamUpdate, DolbyStateFn onDolbyState) {
++void EffectDapDmsClient::setCallbacks(ParamUpdateFn onParamUpdate, DolbyStateFn onDolbyState,
++                                      ServiceDiedFn onServiceDied) {
+     Mutex::Autolock _l(mLock);
+     mOnParamUpdate = std::move(onParamUpdate);
+     mOnDolbyState = std::move(onDolbyState);
++    mOnServiceDied = std::move(onServiceDied);
+ }
+ 
+ status_t EffectDapDmsClient::connect(audio_session_t sessionId, audio_io_handle_t ioHandle) {
+-    Mutex::Autolock _l(mLock);
+-    if (mRegistered && mSessionId == sessionId && mIoHandle == ioHandle) {
+-        return NO_ERROR;
+-    }
+-    if (mRegistered) {
+-        disconnectLocked();
+-    }
++    {
++        Mutex::Autolock _l(mLock);
++        if (mRegistered && mSessionId == sessionId && mIoHandle == ioHandle) {
++            return NO_ERROR;
++        }
++        if (mRegistered) {
++            disconnectLocked();
++        }
+ 
+-    if (mHidl == nullptr) {
+-        mHidl = std::make_unique<HidlState>();
+-        mHidl->callbacks = new HidlState::Callbacks(this);
+-        mHidl->deathRecipient = new HidlState::ServiceDeathRecipient(this);
+-    }
++        if (mHidl == nullptr) {
++            mHidl = std::make_unique<HidlState>();
++            mHidl->callbacks = new HidlState::Callbacks(this);
++            mHidl->deathRecipient = new HidlState::ServiceDeathRecipient(this);
++        }
+ 
+-    mHidl->service = IDms::tryGetService(kDmsServiceName);
+-    if (mHidl->service == nullptr) {
+-        ALOGW("%s Cannot get Dolby manager service.", __func__);
+-        return NO_INIT;
+-    }
++        mHidl->service = IDms::tryGetService(kDmsServiceName);
++        if (mHidl->service == nullptr) {
++            ALOGW("%s Cannot get Dolby manager service.", __func__);
++            return NO_INIT;
++        }
+ 
+-    Return<bool> linkStatus = mHidl->service->linkToDeath(mHidl->deathRecipient, 0);
+-    ALOGI("registerClient() linkToDeath = %d", linkStatus.isOk() && linkStatus ? 1 : 0);
++        Return<bool> linkStatus = mHidl->service->linkToDeath(mHidl->deathRecipient, 0);
++        ALOGI("registerClient() linkToDeath = %d", linkStatus.isOk() && linkStatus ? 1 : 0);
+ 
+-    mHidl->service->registerClient(mHidl->callbacks, static_cast<int32_t>(sessionId),
+-            static_cast<int32_t>(ioHandle));
+-    mSessionId = sessionId;
+-    mIoHandle = ioHandle;
+-    mRegistered = true;
++        Return<void> registerStatus = mHidl->service->registerClient(mHidl->callbacks,
++                static_cast<int32_t>(sessionId), static_cast<int32_t>(ioHandle));
++        if (!registerStatus.isOk()) {
++            ALOGW("%s registerClient failed: %s", __func__,
++                    registerStatus.description().c_str());
++            mHidl->service.clear();
++            return FAILED_TRANSACTION;
++        }
++        mSessionId = sessionId;
++        mIoHandle = ioHandle;
++        mRegistered = true;
++    }
+     ALOGI("%s() registered session=%d io=%d", __func__, sessionId, ioHandle);
+-    refreshCachedStateLocked();
++    // Query the cached state after dropping mLock: the state callback takes the
++    // EffectDapController lock and must never nest inside the DMS lock (the
++    // controller lock is taken while disconnecting, which is the reverse order).
++    refreshCachedState();
+     return NO_ERROR;
+ }
+ 
+@@ -123,9 +144,19 @@ void EffectDapDmsClient::disconnect() {
+     disconnectLocked();
+ }
+ 
+-void EffectDapDmsClient::refreshCachedState() {
++void EffectDapDmsClient::detach() {
+     Mutex::Autolock _l(mLock);
+-    refreshCachedStateLocked();
++    disconnectLocked();
++    if (mHidl != nullptr) {
++        if (mHidl->callbacks != nullptr) mHidl->callbacks->detach();
++        if (mHidl->deathRecipient != nullptr) mHidl->deathRecipient->detach();
++        mHidl->service.clear();
++        mHidl->callbacks.clear();
++        mHidl->deathRecipient.clear();
++    }
++    mOnParamUpdate = nullptr;
++    mOnDolbyState = nullptr;
++    mOnServiceDied = nullptr;
+ }
+ 
+ void EffectDapDmsClient::onDapParamUpdate(const std::vector<uint8_t>& params) {
+@@ -140,11 +171,19 @@ void EffectDapDmsClient::onDapParamUpdate(const std::vector<uint8_t>& params) {
+ }
+ 
+ void EffectDapDmsClient::onServiceDied() {
+-    Mutex::Autolock _l(mLock);
+-    if (mHidl != nullptr) {
+-        mHidl->service.clear();
++    ServiceDiedFn cb;
++    {
++        Mutex::Autolock _l(mLock);
++        if (mHidl != nullptr) {
++            mHidl->service.clear();
++        }
++        mRegistered = false;
++        cb = mOnServiceDied;
++    }
++    // Outside mLock: the controller re-queues a connection attempt.
++    if (cb) {
++        cb();
+     }
+-    mRegistered = false;
+ }
+ 
+ void EffectDapDmsClient::disconnectLocked() {
+@@ -163,29 +202,39 @@ void EffectDapDmsClient::disconnectLocked() {
+     mIoHandle = AUDIO_IO_HANDLE_NONE;
+ }
+ 
+-void EffectDapDmsClient::refreshCachedStateLocked() {
+-    if (mHidl == nullptr || mHidl->service == nullptr) {
+-        return;
+-    }
+-    DolbyStateFn stateCb = mOnDolbyState;
+-
+-    auto query = [&](int32_t paramId, const char* label) {
+-        auto result = mHidl->service->getIntParam(paramId);
+-        if (!result.isOk()) {
+-            ALOGW("%s() getIntParam(%d) failed: %s", __func__, paramId,
+-                    result.description().c_str());
++void EffectDapDmsClient::refreshCachedState() {
++    DolbyStateFn stateCb;
++    bool haveDolbyState = false;
++    bool dolbyOn = false;
++    {
++        Mutex::Autolock _l(mLock);
++        if (mHidl == nullptr || mHidl->service == nullptr) {
+             return;
+         }
+-        const int64_t value = result;
+-        ALOGI("  %s status cached: %s", label, dolbyEffectOnLabel(value));
+-        if (paramId == DMS_INT_PARAM_DOLBY_EFFECT_ON && stateCb) {
+-            stateCb(value != 0);
+-        }
+-    };
++        stateCb = mOnDolbyState;
++
++        auto query = [&](int32_t paramId, const char* label) {
++            auto result = mHidl->service->getIntParam(paramId);
++            if (!result.isOk()) {
++                ALOGW("%s() getIntParam(%d) failed: %s", __func__, paramId,
++                        result.description().c_str());
++                return;
++            }
++            const int64_t value = result;
++            ALOGI("  %s status cached: %s", label, dolbyEffectOnLabel(value));
++            if (paramId == DMS_INT_PARAM_DOLBY_EFFECT_ON) {
++                dolbyOn = value != 0;
++                haveDolbyState = true;
++            }
++        };
+ 
+-    query(DMS_INT_PARAM_DOLBY_EFFECT_ON, "DolbyEffect On");
+-    query(DMS_INT_PARAM_DOLBY_CONTENTS, "Dolby Contents");
+-    query(DMS_INT_PARAM_DOLBY_PRIORITIZED, "Dolby Prioritized");
++        query(DMS_INT_PARAM_DOLBY_EFFECT_ON, "DolbyEffect On");
++        query(DMS_INT_PARAM_DOLBY_CONTENTS, "Dolby Contents");
++        query(DMS_INT_PARAM_DOLBY_PRIORITIZED, "Dolby Prioritized");
++    }
++    if (haveDolbyState && stateCb) {
++        stateCb(dolbyOn);
++    }
+ }
+ 
+ } // namespace android
+diff --git a/services/audioflinger/EffectDapDmsClient.h b/services/audioflinger/EffectDapDmsClient.h
+index 971440b..bf033d4 100644
+--- a/services/audioflinger/EffectDapDmsClient.h
++++ b/services/audioflinger/EffectDapDmsClient.h
+@@ -17,15 +17,19 @@ class EffectDapDmsClient {
+ public:
+     using ParamUpdateFn = std::function<void(const std::vector<uint8_t>& params)>;
+     using DolbyStateFn = std::function<void(bool dolbyOn)>;
++    using ServiceDiedFn = std::function<void()>;
+ 
+     EffectDapDmsClient();
+     ~EffectDapDmsClient();
+ 
+-    void setCallbacks(ParamUpdateFn onParamUpdate, DolbyStateFn onDolbyState);
++    void setCallbacks(ParamUpdateFn onParamUpdate, DolbyStateFn onDolbyState,
++                      ServiceDiedFn onServiceDied);
+ 
+     status_t connect(audio_session_t sessionId, audio_io_handle_t ioHandle);
+     void disconnect();
+     void refreshCachedState();
++    // Detaches the HIDL callbacks from this object before it is destroyed.
++    void detach();
+ 
+ private:
+     friend struct HidlState;
+@@ -33,7 +37,6 @@ private:
+     void onDapParamUpdate(const std::vector<uint8_t>& params);
+     void onServiceDied();
+     void disconnectLocked() REQUIRES(mLock);
+-    void refreshCachedStateLocked() REQUIRES(mLock);
+ 
+     struct HidlState;
+     std::unique_ptr<HidlState> mHidl;
+@@ -41,6 +44,7 @@ private:
+     Mutex mLock;
+     ParamUpdateFn mOnParamUpdate;
+     DolbyStateFn mOnDolbyState;
++    ServiceDiedFn mOnServiceDied;
+     audio_session_t mSessionId = AUDIO_SESSION_NONE;
+     audio_io_handle_t mIoHandle = AUDIO_IO_HANDLE_NONE;
+     bool mRegistered = false;
+diff --git a/services/audioflinger/Effects.h b/services/audioflinger/Effects.h
+index 3be12ba..f06769d 100644
+--- a/services/audioflinger/Effects.h
++++ b/services/audioflinger/Effects.h
+@@ -25,6 +25,7 @@
+ #include <private/media/AudioEffectShared.h>
+ 
+ #include <map>  // avoid transitive dependency
++#include <atomic>
+ #include <optional>
+ #include <vector>
+ 
+@@ -300,7 +301,9 @@ private:
+     uint32_t mInChannelCountRequested;
+     uint32_t mOutChannelCountRequested;
+ 
+-    bool mSkipEffectProcess = false;
++    // Written by the EffectDapController (binder/command threads) and read by
++    // the mixer thread without a lock.
++    std::atomic<bool> mSkipEffectProcess{false};
+ 
+     template <typename MUTEX>
+     class AutoLockReentrant {
+diff --git a/services/audioflinger/SonyEffectPriorityApps.cpp b/services/audioflinger/SonyEffectPriorityApps.cpp
+index 81b6790..149f587 100644
+--- a/services/audioflinger/SonyEffectPriorityApps.cpp
++++ b/services/audioflinger/SonyEffectPriorityApps.cpp
+@@ -28,6 +28,7 @@ constexpr const char* kPackageCloseTag = "</package-name>";
+ 
+ std::mutex gPresetMutex;
+ String8 gCachedPreset;
++bool gLoadAttempted = false;
+ 
+ size_t countCommaSeparated(const String8& value) {
+     if (value.size() == 0) {
+@@ -81,6 +82,12 @@ String8 loadPresetFromXml() {
+     if (gCachedPreset.size() > 0) {
+         return gCachedPreset;
+     }
++    // The read happens under AudioFlinger_Mutex on the first getParameters();
++    // do not retry it on every call when the file is missing or malformed.
++    if (gLoadAttempted) {
++        return {};
++    }
++    gLoadAttempted = true;
+ 
+     std::ifstream in(kWhiteListXmlPath);
+     if (!in) {
+diff --git a/services/audioflinger/SonyRoutingInvalidate.cpp b/services/audioflinger/SonyRoutingInvalidate.cpp
+index 2925257..db9c7d9 100644
+--- a/services/audioflinger/SonyRoutingInvalidate.cpp
++++ b/services/audioflinger/SonyRoutingInvalidate.cpp
+@@ -15,6 +15,7 @@
+ #include <utils/Log.h>
+ 
+ #include <atomic>
++#include <ctime>
+ 
+ namespace android {
+ 
+@@ -29,9 +30,10 @@ std::atomic<bool> gWorkerRunning{false};
+ std::atomic<bool> gInvalidateAllTracks{false};
+ std::atomic<int> gSleepBeforeUsOverride{-1};
+ pthread_t gWorkerThread{};
++bool gWorkerStarted = false;
+ pthread_mutex_t gMutex = PTHREAD_MUTEX_INITIALIZER;
+ pthread_cond_t gCond = PTHREAD_COND_INITIALIZER;
+-AudioFlinger* gAudioFlinger = nullptr;
++std::atomic<AudioFlinger*> gAudioFlinger{nullptr};
+ 
+ int sonySleepUs(const char* prop, int defaultUs) {
+     const int value = property_get_int32(prop, defaultUs);
+@@ -42,6 +44,29 @@ bool sonyFrameworkInvalidateSkipped() {
+     return property_get_bool("persist.audio.invalidate_skip", false);
+ }
+ 
++// Returns false when shutdown was requested while sleeping.
++bool sonySleepInterruptible(int us) {
++    if (us <= 0) {
++        return gWorkerRunning.load();
++    }
++    struct timespec ts;
++    clock_gettime(CLOCK_REALTIME, &ts);
++    const long long addNs = static_cast<long long>(us) * 1000;
++    ts.tv_sec += static_cast<time_t>(addNs / 1000000000LL);
++    ts.tv_nsec += static_cast<long>(addNs % 1000000000LL);
++    if (ts.tv_nsec >= 1000000000L) {
++        ts.tv_sec += 1;
++        ts.tv_nsec -= 1000000000L;
++    }
++    pthread_mutex_lock(&gMutex);
++    if (gWorkerRunning.load()) {
++        pthread_cond_timedwait(&gCond, &gMutex, &ts);
++    }
++    const bool running = gWorkerRunning.load();
++    pthread_mutex_unlock(&gMutex);
++    return running;
++}
++
+ void* workerEntry(void* /*arg*/) {
+     while (gWorkerRunning.load()) {
+         uint32_t reqId = 0;
+@@ -68,16 +93,15 @@ void* workerEntry(void* /*arg*/) {
+         const int sleepBefore = sleepBeforeOverride >= 0
+                 ? sleepBeforeOverride
+                 : sonySleepUs("persist.audio.invalidate_sleep_before", kDefaultSleepBeforeUs);
+-        if (sleepBefore > 0) {
+-            usleep(static_cast<useconds_t>(sleepBefore));
++        if (sleepBefore > 0 && !sonySleepInterruptible(sleepBefore)) {
++            break;
+         }
+         if (gRequestId.load() != reqId) {
+             ALOGV("%s: coalesced req=%u", __func__, reqId);
+             continue;
+         }
+ 
+-        AudioFlinger* af = gAudioFlinger;
+-        if (af != nullptr) {
++        if (AudioFlinger* af = gAudioFlinger.load()) {
+             const bool invalidateAll = gInvalidateAllTracks.exchange(false);
+             ALOGI("%s: invalidate music tracks req=%u all=%d sleep_before=%dus", __func__, reqId,
+                   invalidateAll ? 1 : 0, sleepBefore);
+@@ -87,21 +111,28 @@ void* workerEntry(void* /*arg*/) {
+         const int sleepAfter =
+                 sonySleepUs("persist.audio.invalidate_sleep_after", kDefaultSleepAfterUs);
+         if (sleepAfter > 0 && gRequestId.load() == reqId) {
+-            usleep(static_cast<useconds_t>(sleepAfter));
++            if (!sonySleepInterruptible(sleepAfter)) {
++                break;
++            }
+         }
+     }
+     return nullptr;
+ }
+ 
+ void ensureWorkerStarted() {
+-    if (gWorkerRunning.exchange(true)) {
++    pthread_mutex_lock(&gMutex);
++    if (gWorkerStarted) {
++        pthread_mutex_unlock(&gMutex);
+         return;
+     }
+-    pthread_attr_t attr;
+-    pthread_attr_init(&attr);
+-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+-    pthread_create(&gWorkerThread, &attr, workerEntry, nullptr);
+-    pthread_attr_destroy(&attr);
++    gWorkerRunning.store(true);
++    if (pthread_create(&gWorkerThread, nullptr, workerEntry, nullptr) != 0) {
++        ALOGE("%s: cannot start routing worker", __func__);
++        gWorkerRunning.store(false);
++    } else {
++        gWorkerStarted = true;
++    }
++    pthread_mutex_unlock(&gMutex);
+ }
+ 
+ }  // namespace
+@@ -111,7 +142,7 @@ void scheduleSonyMusicRoutingInvalidate(AudioFlinger* audioFlinger, bool invalid
+     if (audioFlinger == nullptr) {
+         return;
+     }
+-    gAudioFlinger = audioFlinger;
++    gAudioFlinger.store(audioFlinger);
+     if (invalidateAll) {
+         gInvalidateAllTracks.store(true);
+     }
+@@ -130,11 +161,20 @@ void scheduleSonyMusicRoutingInvalidate(AudioFlinger* audioFlinger, bool invalid
+ }
+ 
+ void shutdownSonyMusicRoutingInvalidate() {
+-    gWorkerRunning.store(false);
+-    pthread_mutex_lock(&gMutex);
+-    pthread_cond_signal(&gCond);
+-    pthread_mutex_unlock(&gMutex);
+-    gAudioFlinger = nullptr;
++    bool started = false;
++    {
++        pthread_mutex_lock(&gMutex);
++        gWorkerRunning.store(false);
++        started = gWorkerStarted;
++        gWorkerStarted = false;
++        pthread_cond_broadcast(&gCond);
++        pthread_mutex_unlock(&gMutex);
++    }
++    // Join before AudioFlinger goes away: the worker dereferences it.
++    if (started) {
++        pthread_join(gWorkerThread, nullptr);
++    }
++    gAudioFlinger.store(nullptr);
+ }
+ 
+ }  // namespace android
+-- 
+2.53.0
+

@@ -1,0 +1,274 @@
+From 2f3060b5ffe4a535e54ecf805d18ae7a26b2138d Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Thu, 12 Nov 2026 16:28:50 +0800
+Subject: [PATCH] audioflinger: keep the DAP controller lock off the HAL query
+ and the mixer
+
+EffectDapController::mLock was held across AudioFlinger::getParameters()
+(AudioFlinger_Mutex + hardwareMutex + HAL IPC) in onUpmixPlayingPkg(),
+onSomcPrioritizedApps() and onSomcExcludedApps(), while the mixer thread took
+mLock with ThreadBase_Mutex already held from prepareTracks_l(). A third thread
+in AudioFlinger::releaseAudioSessionId() closed the cycle:
+
+  mixer:          ThreadBase_Mutex -> mLock
+  audio command:  mLock -> AudioFlinger_Mutex
+  binder:         AudioFlinger_Mutex -> lockEffectChains_l -> ThreadBase_Mutex
+
+audioserver then aborted with a TimeCheck timeout for
+IAudioPolicyService::getStreamTypeForAttributes, because audio policy held
+AudioPolicyService_Mutex while waiting for the audio command thread.
+
+Resolve the upmix-supported-package state in two phases: update the snapshot and
+run the list checks under mLock, then query the HAL and the package manager
+outside it, and finally apply the result under the lock. mLock is a leaf lock
+again.
+
+Also make consumePendingMlVolumeResync() lock-free: it runs on the mixer thread
+with ThreadBase_Mutex held, so it must never block on mLock. A pointer identity
+token in an atomic is enough because the thread handle is only compared.
+
+Change-Id: Id8b4fbd0450c0f185e6cfacd3fbcfc7759a3607d
+---
+ services/audioflinger/EffectDapController.cpp | 107 ++++++++++++------
+ services/audioflinger/EffectDapController.h   |  10 +-
+ 2 files changed, 81 insertions(+), 36 deletions(-)
+
+diff --git a/services/audioflinger/EffectDapController.cpp b/services/audioflinger/EffectDapController.cpp
+index aa969f0..12c0bca 100644
+--- a/services/audioflinger/EffectDapController.cpp
++++ b/services/audioflinger/EffectDapController.cpp
+@@ -203,35 +203,49 @@ status_t EffectDapController::setSkipEffectProcess_l(const sp<IAfEffectModule>&
+     return NO_ERROR;
+ }
+ 
+-bool EffectDapController::isPlayingPkgPrioritized_l() const {
+-    if (pkgInSomcList(mPlayingPkgName, mExcludedApps)) {
++// Pure state check, no locking: callers pass a snapshot taken under mLock.
++bool EffectDapController::isPkgPrioritized(const std::string& pkgName, uid_t uid,
++                                           const std::vector<std::string>& prioritized,
++                                           const std::vector<std::string>& excluded) {
++    if (pkgInSomcList(pkgName, excluded)) {
+         return false;
+     }
+-    if (pkgInSomcList(mPlayingPkgName, mPrioritizedApps)) {
++    if (pkgInSomcList(pkgName, prioritized)) {
+         return true;
+     }
+-    if (mPlayingPkgUid == static_cast<uid_t>(-1) || mPlayingPkgUid == 0) {
++    if (uid == static_cast<uid_t>(-1) || uid == 0) {
+         return false;
+     }
+     PermissionController permissionController;
+-    for (const auto& pkg : mPrioritizedApps) {
++    for (const auto& pkg : prioritized) {
+         const int pkgUid = permissionController.getPackageUid(String16(pkg.c_str()), 0);
+-        if (pkgUid >= 0 && static_cast<uid_t>(pkgUid) == mPlayingPkgUid) {
++        if (pkgUid >= 0 && static_cast<uid_t>(pkgUid) == uid) {
+             return true;
+         }
+     }
+     return false;
+ }
+ 
+-bool EffectDapController::queryUpmixSupportedPkg_l() {
+-    if (isPlayingPkgPrioritized_l()) {
+-        ALOGI("%s: Upmix Supported Pkg status cached: prioritized list", __func__);
++// Must be called WITHOUT mLock held. querySonyHalParameters() takes
++// AudioFlinger_Mutex + hardwareMutex and then does HAL IPC; holding mLock across
++// it inverts against the mixer thread (ThreadBase_Mutex -> mLock) and deadlocks:
++//   mixer: ThreadBase_Mutex -> mLock
++//   audio command thread: mLock -> AudioFlinger_Mutex
++//   binder: AudioFlinger_Mutex -> lockEffectChains_l() -> ThreadBase_Mutex
++bool EffectDapController::queryUpmixSupportedPkg(bool prioritized) const {
++    if (prioritized) {
++        ALOGI("queryUpmixSupportedPkg: Upmix Supported Pkg status cached: prioritized list");
+         return true;
+     }
+-    if (mAudioFlinger == nullptr) {
++    AudioFlinger* audioFlinger = nullptr;
++    {
++        Mutex::Autolock _l(mLock);
++        audioFlinger = mAudioFlinger;
++    }
++    if (audioFlinger == nullptr) {
+         return false;
+     }
+-    const String8 result = mAudioFlinger->querySonyHalParameters(String8("isUpmixSupportedPkg"));
++    const String8 result = audioFlinger->querySonyHalParameters(String8("isUpmixSupportedPkg"));
+     if (result.length() == 0) {
+         return false;
+     }
+@@ -239,13 +253,14 @@ bool EffectDapController::queryUpmixSupportedPkg_l() {
+     int value = 0;
+     if (param.getInt(String8("isUpmixSupportedPkg"), value) == NO_ERROR) {
+         const bool supported = value != 0;
+-        ALOGI("%s: Upmix Supported Pkg status cached: HAL=%d", __func__, supported ? 1 : 0);
++        ALOGI("queryUpmixSupportedPkg: Upmix Supported Pkg status cached: HAL=%d",
++              supported ? 1 : 0);
+         return supported;
+     }
+     String8 str;
+     if (param.get(String8("isUpmixSupportedPkg"), str) == NO_ERROR) {
+         const bool supported = str == "1" || str == "true";
+-        ALOGI("%s: Upmix Supported Pkg status cached: HAL=%s", __func__, str.c_str());
++        ALOGI("queryUpmixSupportedPkg: Upmix Supported Pkg status cached: HAL=%s", str.c_str());
+         return supported;
+     }
+     return false;
+@@ -305,6 +320,7 @@ void EffectDapController::on360RaContents(bool active) {
+ }
+ 
+ void EffectDapController::onUpmixPlayingPkg(uid_t uid, const char* packageName) {
++    bool prioritized;
+     {
+         Mutex::Autolock _l(mLock);
+         mPlayingPkgUid = uid;
+@@ -315,10 +331,18 @@ void EffectDapController::onUpmixPlayingPkg(uid_t uid, const char* packageName)
+             mPlayingPkgName.clear();
+             ALOGI("%s: uid=%u", __func__, uid);
+         }
+-        mUpmixSupportedPkg = queryUpmixSupportedPkg_l();
++        prioritized = isPkgPrioritized(mPlayingPkgName, mPlayingPkgUid,
++                                       mPrioritizedApps, mExcludedApps);
++    }
++    // HAL query and the package-manager lookup run outside mLock, see
++    // queryUpmixSupportedPkg().
++    const bool supported = queryUpmixSupportedPkg(prioritized);
++    char value[PROPERTY_VALUE_MAX] = {};
++    property_get(kDolbyEnabledProp, value, "0");
++    {
++        Mutex::Autolock _l(mLock);
++        mUpmixSupportedPkg = supported;
+         updateEffectPriority_l();
+-        char value[PROPERTY_VALUE_MAX] = {};
+-        property_get(kDolbyEnabledProp, value, "0");
+         const bool dolbyOn = mDolbyHalOn || parseDolbyEnabledProp(value);
+         finishRoutingUpdate_l(dolbyOn);
+     }
+@@ -326,6 +350,7 @@ void EffectDapController::onUpmixPlayingPkg(uid_t uid, const char* packageName)
+ }
+ 
+ void EffectDapController::onSomcPrioritizedApps(const char* prioritizedApps) {
++    bool prioritized;
+     {
+         Mutex::Autolock _l(mLock);
+         // SE thoat Effect Priority van SetParameters cung list — khong invalidate neu khong doi
+@@ -336,10 +361,16 @@ void EffectDapController::onSomcPrioritizedApps(const char* prioritizedApps) {
+         mPrioritizedApps = std::move(next);
+         ALOGI("%s: prioritized=%zu playing_pkg=%s", __func__, mPrioritizedApps.size(),
+               mPlayingPkgName.empty() ? "(none)" : mPlayingPkgName.c_str());
+-        mUpmixSupportedPkg = queryUpmixSupportedPkg_l();
++        prioritized = isPkgPrioritized(mPlayingPkgName, mPlayingPkgUid,
++                                       mPrioritizedApps, mExcludedApps);
++    }
++    const bool supported = queryUpmixSupportedPkg(prioritized);
++    char value[PROPERTY_VALUE_MAX] = {};
++    property_get(kDolbyEnabledProp, value, "0");
++    {
++        Mutex::Autolock _l(mLock);
++        mUpmixSupportedPkg = supported;
+         updateEffectPriority_l();
+-        char value[PROPERTY_VALUE_MAX] = {};
+-        property_get(kDolbyEnabledProp, value, "0");
+         const bool dolbyOn = mDolbyHalOn || parseDolbyEnabledProp(value);
+         // Chi invalidate khi DSEE route thuc su doi (giong onUpmixPlayingPkg)
+         finishRoutingUpdate_l(dolbyOn);
+@@ -348,6 +379,7 @@ void EffectDapController::onSomcPrioritizedApps(const char* prioritizedApps) {
+ }
+ 
+ void EffectDapController::onSomcExcludedApps(const char* excludedApps) {
++    bool prioritized;
+     {
+         Mutex::Autolock _l(mLock);
+         // SE thoat Effect Priority van SetParameters cung list — khong invalidate neu khong doi
+@@ -358,10 +390,16 @@ void EffectDapController::onSomcExcludedApps(const char* excludedApps) {
+         mExcludedApps = std::move(next);
+         ALOGI("%s: excluded=%zu playing_pkg=%s", __func__, mExcludedApps.size(),
+               mPlayingPkgName.empty() ? "(none)" : mPlayingPkgName.c_str());
+-        mUpmixSupportedPkg = queryUpmixSupportedPkg_l();
++        prioritized = isPkgPrioritized(mPlayingPkgName, mPlayingPkgUid,
++                                       mPrioritizedApps, mExcludedApps);
++    }
++    const bool supported = queryUpmixSupportedPkg(prioritized);
++    char value[PROPERTY_VALUE_MAX] = {};
++    property_get(kDolbyEnabledProp, value, "0");
++    {
++        Mutex::Autolock _l(mLock);
++        mUpmixSupportedPkg = supported;
+         updateEffectPriority_l();
+-        char value[PROPERTY_VALUE_MAX] = {};
+-        property_get(kDolbyEnabledProp, value, "0");
+         const bool dolbyOn = mDolbyHalOn || parseDolbyEnabledProp(value);
+         // Chi invalidate khi DSEE route thuc su doi (giong onUpmixPlayingPkg)
+         finishRoutingUpdate_l(dolbyOn);
+@@ -434,7 +472,7 @@ void EffectDapController::onDapPregPrepComplete_l() {
+     if (mlThread == nullptr) {
+         return;
+     }
+-    mPendingMlVolumeResync = mlThread;
++    mPendingMlVolumeResyncThread.store(mlThread.get(), std::memory_order_release);
+     mPendingMlForResync.clear();
+ }
+ 
+@@ -538,17 +576,20 @@ void EffectDapController::finishDapRestartForPregain_l() {
+ 
+ bool EffectDapController::consumePendingMlVolumeResync(
+         const sp<IAfPlaybackThread>& thread) {
+-    sp<IAfPlaybackThread> pending;
+-    {
+-        Mutex::Autolock _l(mLock);
+-        pending = mPendingMlVolumeResync.promote();
+-        if (pending == nullptr || pending.get() != thread.get()) {
+-            return false;
+-        }
+-        mPendingMlVolumeResync.clear();
++    if (thread == nullptr) {
++        return false;
+     }
+-    ALOGV("%s() ML volume resync on mixer frame", __func__);
+-    return true;
++    // Runs on the mixer thread with ThreadBase_Mutex held: must not take mLock,
++    // otherwise it deadlocks with the audio command thread (mLock ->
++    // AudioFlinger_Mutex -> lockEffectChains_l -> ThreadBase_Mutex -> mLock).
++    // A pointer identity token is enough, the thread is only compared, never used.
++    const void* expected = thread.get();
++    const bool consumed = mPendingMlVolumeResyncThread.compare_exchange_strong(
++            expected, nullptr, std::memory_order_acq_rel);
++    if (consumed) {
++        ALOGV("%s() ML volume resync on mixer frame", __func__);
++    }
++    return consumed;
+ }
+ 
+ bool EffectDapController::consumePendingDapPregPrep_l(
+diff --git a/services/audioflinger/EffectDapController.h b/services/audioflinger/EffectDapController.h
+index 9fccb48..3c5169c 100644
+--- a/services/audioflinger/EffectDapController.h
++++ b/services/audioflinger/EffectDapController.h
+@@ -63,8 +63,10 @@ private:
+     static bool isDapEffect(const sp<IAfEffectBase>& effect);
+     static bool isUpmixEffect(const sp<IAfEffectBase>& effect);
+     void updateEffectPriority_l();
+-    bool queryUpmixSupportedPkg_l();
+-    bool isPlayingPkgPrioritized_l() const;
++    bool queryUpmixSupportedPkg(bool prioritized) const;
++    static bool isPkgPrioritized(const std::string& pkgName, uid_t uid,
++                                 const std::vector<std::string>& prioritized,
++                                 const std::vector<std::string>& excluded);
+     status_t setSkipEffectProcess_l(const sp<IAfEffectModule>& effect, bool skip);
+     status_t setBypass_l(bool bypass);
+     void applyBypassState_l(bool dolbyOn);
+@@ -96,7 +98,9 @@ private:
+     std::vector<std::string> mPrioritizedApps;
+     std::vector<std::string> mExcludedApps;
+     wp<IAfPlaybackThread> mDapPlaybackThread;
+-    wp<IAfPlaybackThread> mPendingMlVolumeResync;
++    // Consumed on the mixer thread with ThreadBase_Mutex held, so this is a plain
++    // atomic identity token instead of an mLock-protected wp<>.
++    std::atomic<const void*> mPendingMlVolumeResyncThread{nullptr};
+     wp<IAfPlaybackThread> mPendingMlPregPrep;
+     wp<IAfPlaybackThread> mPendingDapPregPrep;
+     wp<IAfPlaybackThread> mPendingMlForResync;
+-- 
+2.53.0
+
