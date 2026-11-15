@@ -1,7 +1,7 @@
-From f6afb93bfa315c23cdff1c38c6fb8c598feb01da Mon Sep 17 00:00:00 2001
+From c700dfd10b84049d8e0b5a959630131e9045397c Mon Sep 17 00:00:00 2001
 From: onlyfish <linotfish@outlook.com>
 Date: Wed, 4 Nov 2026 11:38:46 +0800
-Subject: [PATCH 6/6] media: Sony DSEE codec client hooks
+Subject: [PATCH] media: Sony DSEE codec client hooks
 
 Notify the Sony PAL DSEE wrapper of the active audio decoder via
 AudioSystem parameters (codec_client_uid/state/format/bitrate), and

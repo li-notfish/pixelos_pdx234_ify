@@ -1,7 +1,7 @@
-From bedbb5103cbed43edcc92836c4cb68da356f37b8 Mon Sep 17 00:00:00 2001
+From 51f7b8dc72be7dff2b529994e5bbc14497ad7c73 Mon Sep 17 00:00:00 2001
 From: onlyfish <linotfish@outlook.com>
-Date: Wed, 4 Nov 2026 11:38:46 +0800
-Subject: [PATCH 5/6] audiopolicy: Sony 360RA/Dolby port
+Date: Sun, 15 Nov 2026 18:02:06 +0800
+Subject: [PATCH] audiopolicy: Sony 360RA/Dolby port
 
 Add Sony's Dolby/DSEE aware output routing:
 
@@ -11,18 +11,22 @@ Add Sony's Dolby/DSEE aware output routing:
 - AudioPolicyService: local invalidateMusicStreamsForSonyRouting hook
 
 Change-Id: I3e7b9c2d5a8f4e1b6c0d9a2e7f3b8c5d1a4e6b09
+
+Patch-series squash: absorbs 0011 (360RA audio_prop); content unchanged.
+
+Change-Id: Ie69ef45506562174f6769621dea553d696080792
 ---
  .../audiopolicy/managerdefault/Android.bp     |   2 +
  .../managerdefault/AudioPolicyManager.cpp     | 213 +++++++++++--
  .../managerdefault/AudioPolicyManager.h       |   4 +
- .../managerdefault/Sony360RAudioPolicy.cpp    | 284 ++++++++++++++++++
+ .../managerdefault/Sony360RAudioPolicy.cpp    | 287 ++++++++++++++++++
  .../managerdefault/Sony360RAudioPolicy.h      |  33 ++
  .../managerdefault/SonyDolbyAudioPolicy.cpp   | 239 +++++++++++++++
  .../managerdefault/SonyDolbyAudioPolicy.h     |  29 ++
  .../service/AudioPolicyService.cpp            |  13 +
  .../audiopolicy/service/AudioPolicyService.h  |   1 +
  .../include/media/IAudioPolicyServiceLocal.h  |   3 +
- 10 files changed, 799 insertions(+), 22 deletions(-)
+ 10 files changed, 802 insertions(+), 22 deletions(-)
  create mode 100644 services/audiopolicy/managerdefault/Sony360RAudioPolicy.cpp
  create mode 100644 services/audiopolicy/managerdefault/Sony360RAudioPolicy.h
  create mode 100644 services/audiopolicy/managerdefault/SonyDolbyAudioPolicy.cpp
@@ -427,10 +431,10 @@ index bdd656a..a6e760e 100644
  
 diff --git a/services/audiopolicy/managerdefault/Sony360RAudioPolicy.cpp b/services/audiopolicy/managerdefault/Sony360RAudioPolicy.cpp
 new file mode 100644
-index 0000000..1a995d9
+index 0000000..68a9676
 --- /dev/null
 +++ b/services/audiopolicy/managerdefault/Sony360RAudioPolicy.cpp
-@@ -0,0 +1,284 @@
+@@ -0,0 +1,287 @@
 +/*
 + * SPDX-License-Identifier: Apache-2.0
 + */
@@ -482,7 +486,10 @@ index 0000000..1a995d9
 +
 +bool sony360RaEnabled() {
 +    char value[PROPERTY_VALUE_MAX] = {};
-+    property_get("vendor.360ra.effect", value, "");
++    // vendor.360ra.effect is vendor_default_prop, which coredomain (audioserver)
++    // cannot read. The effect libraries in the audio HAL keep using that one; the
++    // policy reads a system copy with the audio_prop label instead.
++    property_get("persist.audio.360ra.effect", value, "");
 +    return value[0] == '1';
 +}
 +

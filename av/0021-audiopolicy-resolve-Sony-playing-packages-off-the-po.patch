@@ -1,0 +1,299 @@
+From 8456d25b08a40be2e3f00c4bb627d74f192b22d4 Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Sun, 15 Nov 2026 14:34:37 +0800
+Subject: [PATCH] audiopolicy: resolve Sony playing packages off the policy
+ lock
+
+sonyNotifyPlayingPkgUid() and sonyNotifyUpmixPlayingPkg() called
+sonyPackageNameForUid() from AudioPolicyManager::startOutput(), i.e. with
+AudioPolicyService_Mutex held. That function does a PermissionController
+binder call to system_server and, when the answer is empty, scans
+/data/system/packages.list. Negative answers were not cached, so a uid
+without a package (media, isolated, some system uids) re-ran the whole
+lookup on every music track start while holding the policy lock.
+
+Resolve the name on the Sony HAL worker instead:
+
+- The notifiers now queue a Write task that carries only the uid.
+  sonyExecutePkgWrite() resolves the name on the worker and then builds
+  playing_pkg_uid/name or chk_upmix_playing_pkg_uid/name, so the HAL sees
+  the same parameters in the same FIFO position as before.
+- The reassert stash updates the uid at enqueue time (uid 0 / -1 clears
+  it) but leaves the name empty until the worker fills it. A reassert
+  that runs before the write therefore never replays a name belonging to
+  a different uid, and the worker only stores the name when the stashed
+  uid still matches.
+- Cache positive answers for 10 minutes and negative answers for 30
+  seconds, and skip isolated uids (which never own a package). System and
+  media uids keep the old lookup behaviour.
+
+No AudioPolicyManager changes; the notify entry points keep their
+signatures.
+
+Change-Id: I3e8f1b6a9d4c7f2a5b0e8d3c6a1f9e4b7d2c5a81
+---
+ .../managerdefault/Sony360RAudioPolicy.cpp    |  48 +++++---
+ .../managerdefault/SonyDolbyAudioPolicy.cpp   | 113 +++++++++++++-----
+ .../managerdefault/SonyDolbyAudioPolicy.h     |   4 +
+ 3 files changed, 123 insertions(+), 42 deletions(-)
+
+diff --git a/services/audiopolicy/managerdefault/Sony360RAudioPolicy.cpp b/services/audiopolicy/managerdefault/Sony360RAudioPolicy.cpp
+index 5d399ac..432e9ca 100644
+--- a/services/audiopolicy/managerdefault/Sony360RAudioPolicy.cpp
++++ b/services/audiopolicy/managerdefault/Sony360RAudioPolicy.cpp
+@@ -35,9 +35,26 @@ int gLast360RaContents = -1;
+ nsecs_t gLast360RaSendNs = 0;
+ 
+ // uid -> package name, resolved through PermissionController (a binder call to
+-// system_server) plus a /data/system/packages.list fallback.
++// system_server) plus a /data/system/packages.list fallback. Positive answers are
++// stable for minutes; negative answers are cached briefly so a uid with no
++// package (system, media, isolated) does not re-run the lookup on every track.
++constexpr nsecs_t kPkgNamePositiveTtlNs = 10 * 60 * 1000000000LL;  // 10 min
++constexpr nsecs_t kPkgNameNegativeTtlNs = 30 * 1000000000LL;       // 30 s
++
++// Isolated process uids (AID_ISOLATED_START..AID_ISOLATED_END within each user)
++// never belong to a package; everything else goes through the normal lookup so
++// system/media uids keep their pre-0021 behaviour.
++constexpr uid_t kPerUserUidRange = 100000;  // AID_USER_OFFSET
++constexpr uid_t kFirstIsolatedUid = 90000;  // AID_ISOLATED_START
++constexpr uid_t kLastIsolatedUid = 99999;   // AID_ISOLATED_END
++
++struct PkgNameEntry {
++    std::string name;
++    nsecs_t expireNs = 0;
++};
++
+ std::mutex gPkgNameMutex;
+-std::map<uid_t, std::string> gPkgNameCache;
++std::map<uid_t, PkgNameEntry> gPkgNameCache;
+ 
+ bool sonyGetHalInt(AudioPolicyClientInterface* client, const char* key, int* value) {
+     // Cached: every read is a synchronous HIDL round trip made under
+@@ -120,11 +137,16 @@ std::string sonyPackageNameForUid(uid_t uid) {
+     if (uid == 0 || uid == static_cast<uid_t>(-1)) {
+         return {};
+     }
++    const uid_t appId = uid % kPerUserUidRange;
++    if (appId >= kFirstIsolatedUid && appId <= kLastIsolatedUid) {
++        return {};
++    }
++    const nsecs_t now = systemTime(CLOCK_MONOTONIC);
+     {
+         std::lock_guard<std::mutex> lock(gPkgNameMutex);
+         const auto it = gPkgNameCache.find(uid);
+-        if (it != gPkgNameCache.end()) {
+-            return it->second;
++        if (it != gPkgNameCache.end() && now < it->second.expireNs) {
++            return it->second.name;
+         }
+     }
+     std::string resolved;
+@@ -147,9 +169,11 @@ std::string sonyPackageNameForUid(uid_t uid) {
+             }
+         }
+     }
+-    if (!resolved.empty()) {
++    {
+         std::lock_guard<std::mutex> lock(gPkgNameMutex);
+-        gPkgNameCache[uid] = resolved;
++        PkgNameEntry& entry = gPkgNameCache[uid];
++        entry.name = resolved;
++        entry.expireNs = now + (resolved.empty() ? kPkgNameNegativeTtlNs : kPkgNamePositiveTtlNs);
+     }
+     return resolved;
+ }
+@@ -308,15 +332,9 @@ void sonyNotifyUpmixPlayingPkg(AudioPolicyClientInterface* client, audio_io_hand
+         return;
+     }
+     (void)io;
+-    const std::string package = sonyPackageNameForUid(uid);
+-    AudioParameter param;
+-    if (!package.empty()) {
+-        param.add(String8("chk_upmix_playing_pkg_name"), String8(package.c_str()));
+-    }
+-    param.addInt(String8("chk_upmix_playing_pkg_uid"), static_cast<int>(uid));
+-    ALOGI("%s: uid=%u pkg=%s", __func__, uid,
+-          package.empty() ? "(unknown)" : package.c_str());
+-    sonyQueueHalParameterWrite(client, param.toString());
++    ALOGI("%s: uid=%u", __func__, uid);
++    // The worker resolves the package name and writes chk_upmix_playing_pkg_*.
++    sonyQueueUpmixPlayingPkgWrite(client, uid);
+ }
+ 
+ }  // namespace android
+diff --git a/services/audiopolicy/managerdefault/SonyDolbyAudioPolicy.cpp b/services/audiopolicy/managerdefault/SonyDolbyAudioPolicy.cpp
+index 54ea659..794fdb6 100644
+--- a/services/audiopolicy/managerdefault/SonyDolbyAudioPolicy.cpp
++++ b/services/audiopolicy/managerdefault/SonyDolbyAudioPolicy.cpp
+@@ -120,12 +120,20 @@ enum class SonyTaskType {
+     ReassertPlayingPkg,
+ };
+ 
++enum class SonyPkgTarget {
++    None,
++    PlayingPkg,
++    UpmixPlayingPkg,
++};
++
+ struct SonyTask {
+     SonyTaskType type;
+     AudioPolicyClientInterface* client = nullptr;
+-    String8 params;        // Write
++    String8 params;        // Write without pkgTarget
+     std::string key;       // Refresh
+     bool forced = false;   // Refresh
++    SonyPkgTarget pkgTarget = SonyPkgTarget::None;
++    uid_t pkgUid = 0;
+ };
+ 
+ struct SonyWorkerState {
+@@ -210,6 +218,35 @@ void sonyRefreshHalParam(AudioPolicyClientInterface* client, const std::string&
+     sonyPushTaskLocked(std::move(task));
+ }
+ 
++// Runs on the Sony worker: resolving the package name takes a binder call to
++// system_server and, on a miss, a packages.list scan. Neither may run on the
++// AudioPolicyService thread that notifies us.
++void sonyExecutePkgWrite(const SonyTask& task) {
++    const std::string package = sonyPackageNameForUid(task.pkgUid);
++    AudioParameter param;
++    if (task.pkgTarget == SonyPkgTarget::UpmixPlayingPkg) {
++        if (!package.empty()) {
++            param.add(String8("chk_upmix_playing_pkg_name"), String8(package.c_str()));
++        }
++        param.addInt(String8("chk_upmix_playing_pkg_uid"), static_cast<int>(task.pkgUid));
++        ALOGI("%s: upmix uid=%u pkg=%s", __func__, task.pkgUid,
++              package.empty() ? "(unknown)" : package.c_str());
++    } else {
++        param.addInt(String8("playing_pkg_uid"), static_cast<int>(task.pkgUid));
++        if (!package.empty()) {
++            param.add(String8("playing_pkg_name"), String8(package.c_str()));
++        }
++        ALOGI("%s: playing uid=%u pkg=%s", __func__, task.pkgUid,
++              package.empty() ? "(unknown)" : package.c_str());
++        std::lock_guard<std::mutex> lock(gSonyWorker.mutex);
++        if (gSonyWorker.havePlayingPkg &&
++                gSonyWorker.playingPkgUid == static_cast<int>(task.pkgUid)) {
++            gSonyWorker.playingPkgName = package;
++        }
++    }
++    task.client->setParameters(AUDIO_IO_HANDLE_NONE, param.toString(), 0);
++}
++
+ void sonyWorkerLoop() {
+     for (;;) {
+         SonyTask task;
+@@ -235,8 +272,12 @@ void sonyWorkerLoop() {
+         }
+         switch (task.type) {
+         case SonyTaskType::Write:
+-            ALOGD("%s: write %s", __func__, task.params.c_str());
+-            task.client->setParameters(AUDIO_IO_HANDLE_NONE, task.params, 0);
++            if (task.pkgTarget != SonyPkgTarget::None) {
++                sonyExecutePkgWrite(task);
++            } else {
++                ALOGD("%s: write %s", __func__, task.params.c_str());
++                task.client->setParameters(AUDIO_IO_HANDLE_NONE, task.params, 0);
++            }
+             break;
+         case SonyTaskType::Refresh:
+             sonyRefreshHalParam(task.client, task.key, task.forced);
+@@ -323,6 +364,44 @@ void sonyQueueHalParameterWrite(AudioPolicyClientInterface* client, const String
+     sonyPushTaskLocked(std::move(task));
+ }
+ 
++void sonyQueuePlayingPkgWrite(AudioPolicyClientInterface* client, uid_t uid) {
++    if (client == nullptr) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(gSonyWorker.mutex);
++    const bool validUid = uid != 0 && uid != static_cast<uid_t>(-1);
++    gSonyWorker.havePlayingPkg = validUid;
++    gSonyWorker.playingPkgUid = validUid ? static_cast<int>(uid) : 0;
++    // The worker fills the name in before the write; a reassert queued from an
++    // earlier refresh must not replay a stale name for the new uid.
++    gSonyWorker.playingPkgName.clear();
++    gSonyWorker.pendingRefresh.clear();
++    SonyTask task;
++    task.type = SonyTaskType::Write;
++    task.client = client;
++    task.pkgTarget = SonyPkgTarget::PlayingPkg;
++    task.pkgUid = uid;
++    sonyPushTaskLocked(std::move(task));
++    // The HAL derives these from playing_pkg; read them back after the write so
++    // the next routing evaluation sees the values for the new package.
++    sonyQueueRefreshLocked(client, "isUpmixSupportedPkg", true);
++    sonyQueueRefreshLocked(client, "is_dsee_prioritized", true);
++}
++
++void sonyQueueUpmixPlayingPkgWrite(AudioPolicyClientInterface* client, uid_t uid) {
++    if (client == nullptr) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(gSonyWorker.mutex);
++    gSonyWorker.pendingRefresh.clear();
++    SonyTask task;
++    task.type = SonyTaskType::Write;
++    task.client = client;
++    task.pkgTarget = SonyPkgTarget::UpmixPlayingPkg;
++    task.pkgUid = uid;
++    sonyPushTaskLocked(std::move(task));
++}
++
+ bool sonyDolbyEnabled(AudioPolicyClientInterface* client) {
+     bool enabled = false;
+     if (sonyGetHalBool(client, "dle_ds_state", &enabled)) {
+@@ -441,30 +520,10 @@ void sonyNotifyPlayingPkgUid(AudioPolicyClientInterface* client, audio_io_handle
+         return;
+     }
+     (void)io;
+-    const std::string package = sonyPackageNameForUid(uid);
+-    AudioParameter param;
+-    param.addInt(String8("playing_pkg_uid"), static_cast<int>(uid));
+-    if (!package.empty()) {
+-        param.add(String8("playing_pkg_name"), String8(package.c_str()));
+-    }
+-    ALOGI("%s: uid=%u pkg=%s", __func__, uid,
+-          package.empty() ? "(unknown)" : package.c_str());
+-
+-    std::lock_guard<std::mutex> lock(gSonyWorker.mutex);
+-    const bool validUid = uid != 0 && uid != static_cast<uid_t>(-1);
+-    gSonyWorker.havePlayingPkg = validUid;
+-    gSonyWorker.playingPkgUid = validUid ? static_cast<int>(uid) : 0;
+-    gSonyWorker.playingPkgName = validUid ? package : std::string();
+-    gSonyWorker.pendingRefresh.clear();
+-    SonyTask write;
+-    write.type = SonyTaskType::Write;
+-    write.client = client;
+-    write.params = param.toString();
+-    sonyPushTaskLocked(std::move(write));
+-    // The HAL derives these from playing_pkg; read them back after the write so
+-    // the next routing evaluation sees the values for the new package.
+-    sonyQueueRefreshLocked(client, "isUpmixSupportedPkg", true);
+-    sonyQueueRefreshLocked(client, "is_dsee_prioritized", true);
++    ALOGI("%s: uid=%u", __func__, uid);
++    // The package name is resolved on the Sony worker: PermissionController is
++    // a binder call to system_server and must not run under AudioPolicyService_Mutex.
++    sonyQueuePlayingPkgWrite(client, uid);
+ }
+ 
+ bool sonyMusicOutputMatchesRouting(AudioPolicyClientInterface* client,
+diff --git a/services/audiopolicy/managerdefault/SonyDolbyAudioPolicy.h b/services/audiopolicy/managerdefault/SonyDolbyAudioPolicy.h
+index 4a735e3..6bf09fa 100644
+--- a/services/audiopolicy/managerdefault/SonyDolbyAudioPolicy.h
++++ b/services/audiopolicy/managerdefault/SonyDolbyAudioPolicy.h
+@@ -28,6 +28,10 @@ void sonyMarkHalCacheStale();
+ void sonyStoreHalCacheValue(const char* key, const String8& value);
+ // Queue a parameter write for the Sony HAL worker.
+ void sonyQueueHalParameterWrite(AudioPolicyClientInterface* client, const String8& keyValuePairs);
++// Queue a playing-package write. The worker resolves the package name off the
++// policy lock and then emits playing_pkg_uid/name or chk_upmix_playing_pkg_*.
++void sonyQueuePlayingPkgWrite(AudioPolicyClientInterface* client, uid_t uid);
++void sonyQueueUpmixPlayingPkgWrite(AudioPolicyClientInterface* client, uid_t uid);
+ 
+ bool sonyDolbyEnabled(AudioPolicyClientInterface* client);
+ bool sonyDseeHxEnabled(AudioPolicyClientInterface* client);
+-- 
+2.53.0
+

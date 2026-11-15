@@ -1,8 +1,8 @@
-From f80ef118ccacde6be891bdaa354f6a32212dc009 Mon Sep 17 00:00:00 2001
+From be724f4883bb75aee158fcb043f500fa56008b76 Mon Sep 17 00:00:00 2001
 From: onlyfish <linotfish@outlook.com>
 Date: Thu, 12 Nov 2026 16:56:41 +0800
-Subject: [PATCH 1/2] audioflinger: keep all daxService HIDL traffic off the
- audio locks
+Subject: [PATCH] audioflinger: keep all daxService HIDL traffic off the audio
+ locks
 
 EffectDapDmsClient::connect() (tryGetService, linkToDeath, registerClient and
 three getIntParam calls) and disconnect() (unregisterClient) ran synchronously

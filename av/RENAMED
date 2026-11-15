@@ -1,0 +1,45 @@
+# ~/patch/av/RENAMED
+# Patch-series consolidation, 2026-11-15.
+#
+# The gap numbers below were squashed into existing patches after runtime
+# verification (0018 excepted: static-only). Numbers are NOT reused, so this
+# file is the permanent mapping between old and current numbering.
+# Apply order is filename sort order; gaps are intentional and harmless.
+# This file is not a patch and is ignored by apply-patches.sh.
+
+# retired -> current   reason
+0007      -> 0004      squashed: routing invalidation lock order
+0008      -> 0004      squashed: audio_prop tunables
+0010      -> 0009      squashed: defer Music Listener pregain restart
+0011      -> 0005      squashed: 360RA flag from audio_prop
+0014      -> 0019      squashed: Sony HAL read cache (rewritten by 0019)
+0016      -> 0015      squashed: retarget pending pregain restart
+0017      -> (none)    withdrawn: recursive mLock, never existed
+0022      -> 0019      squashed: String8::isEmpty build fix
+
+# current sequence (14 patches)
+0001 0002 0003 0004 0005 0006 0009 0012 0013 0015 0018 0019 0020 0021
+
+# current number -> commit (frameworks/av)
+0004 -> 7bb3306  audioflinger: Sony/Dolby DAP port
+0005 -> 51f7b8d  audiopolicy: Sony 360RA/Dolby port
+0006 -> c700dfd  media: Sony DSEE codec client hooks
+0009 -> 81bbc14  audioflinger: defer DAP pregain restarts to the top of the mix loop
+0012 -> 8bed95f  audioflinger: keep the DAP controller lock off the HAL query and the mixer
+0013 -> be724f4  audioflinger: keep all daxService HIDL traffic off the audio locks
+0015 -> 67ebc7d  audioflinger: keep DAP pregain restart out of ThreadBase and DMS init
+0018 -> 9006562  audioflinger: release the Sony DAP effect outside the chain lock
+0019 -> 92e570d  audiopolicy: move Sony HAL reads and writes off the policy lock
+0020 -> 209969e  audioflinger: evaluate Sony package priority outside the controller lock
+0021 -> 8456d25  audiopolicy: resolve Sony playing packages off the policy lock
+
+# retired number -> old commit (pre-merge chain)
+0007 -> 32b7dc9  0008 -> 225321f  0010 -> 9c14c8b  0011 -> 58f1ac1
+0014 -> e4d4d62  0016 -> 7398f06  0022 -> 084a7b9
+
+# Recovery
+#   old commits:  git branch premerge-0022   (in frameworks/av)
+#   old patches:  ~/patch-av-premerge-20261115-1801/
+#   tree check:   git diff premerge-0022 HEAD   (empty = identical)
+#
+# Next new patch number: 0023

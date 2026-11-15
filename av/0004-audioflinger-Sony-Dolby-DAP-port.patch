@@ -1,7 +1,7 @@
-From 23c08b2b61de4154145d141c2ea872b0e09d47b3 Mon Sep 17 00:00:00 2001
+From 7bb3306df9d427ae13076227719a192152e0ceda Mon Sep 17 00:00:00 2001
 From: onlyfish <linotfish@outlook.com>
-Date: Wed, 4 Nov 2026 11:38:46 +0800
-Subject: [PATCH 4/6] audioflinger: Sony/Dolby DAP port
+Date: Sun, 15 Nov 2026 18:02:06 +0800
+Subject: [PATCH] audioflinger: Sony/Dolby DAP port
 
 Import the Sony audio effect coordination layer from the pdx237 stock
 audio stack so libswdap (DAP), the Dolby DMS HAL (daxService) and the
@@ -16,11 +16,15 @@ audio stack so libswdap (DAP), the Dolby DMS HAL (daxService) and the
 Adapted to Android 17 (per-app volume APIs were removed).
 
 Change-Id: I9f2c4a7d1b8e3f6a0c5d2e9b7a4f1c8d3e6b0a52
+
+Patch-series squash: absorbs 0007 (routing invalidation lock order) and 0008 (audio_prop tunables); content unchanged.
+
+Change-Id: I8f8c868a14867c3a4b339feb9adbc4f71b9d2b58
 ---
  services/audioflinger/Android.bp              |   9 +
  services/audioflinger/AudioFlinger.cpp        | 248 +++++-
  services/audioflinger/AudioFlinger.h          |   7 +
- services/audioflinger/EffectDapController.cpp | 793 ++++++++++++++++++
+ services/audioflinger/EffectDapController.cpp | 804 ++++++++++++++++++
  services/audioflinger/EffectDapController.h   | 119 +++
  services/audioflinger/EffectDapDmsClient.cpp  | 191 +++++
  services/audioflinger/EffectDapDmsClient.h    |  49 ++
@@ -30,13 +34,13 @@ Change-Id: I9f2c4a7d1b8e3f6a0c5d2e9b7a4f1c8d3e6b0a52
  services/audioflinger/IAfThread.h             |   7 +
  .../audioflinger/SonyEffectPriorityApps.cpp   | 123 +++
  .../audioflinger/SonyEffectPriorityApps.h     |  12 +
- .../audioflinger/SonyRoutingInvalidate.cpp    | 140 ++++
+ .../audioflinger/SonyRoutingInvalidate.cpp    | 140 +++
  services/audioflinger/SonyRoutingInvalidate.h |  16 +
  services/audioflinger/Threads.cpp             | 106 +++
  services/audioflinger/Threads.h               |  11 +
  services/audioflinger/dolby_debug.h           |  17 +
  services/audioflinger/ds_config.h             |  17 +
- 19 files changed, 1972 insertions(+), 2 deletions(-)
+ 19 files changed, 1983 insertions(+), 2 deletions(-)
  create mode 100644 services/audioflinger/EffectDapController.cpp
  create mode 100644 services/audioflinger/EffectDapController.h
  create mode 100644 services/audioflinger/EffectDapDmsClient.cpp
@@ -83,7 +87,7 @@ index 5dd33e5..85fcb05 100644
          "MelReporter.cpp",
          "PatchCommandThread.cpp",
 diff --git a/services/audioflinger/AudioFlinger.cpp b/services/audioflinger/AudioFlinger.cpp
-index b37dc6f..f979117 100644
+index b37dc6f..c1d812a 100644
 --- a/services/audioflinger/AudioFlinger.cpp
 +++ b/services/audioflinger/AudioFlinger.cpp
 @@ -25,6 +25,9 @@
@@ -161,12 +165,12 @@ index b37dc6f..f979117 100644
 +
 +int sonyInvalidateSleepBeforeUs(const char* keyValuePairs) {
 +    if (keyValuePairs == nullptr) {
-+        return property_get_int32("vendor.audio.invalidate_sleep_before", 100000);
++        return property_get_int32("persist.audio.invalidate_sleep_before", 100000);
 +    }
 +    if (strstr(keyValuePairs, "dsee_hx_state=1") != nullptr) {
-+        return property_get_int32("vendor.audio.invalidate_sleep_dsee_on", 50000);
++        return property_get_int32("persist.audio.invalidate_sleep_dsee_on", 50000);
 +    }
-+    return property_get_int32("vendor.audio.invalidate_sleep_before", 100000);
++    return property_get_int32("persist.audio.invalidate_sleep_before", 100000);
 +}
 +
 +// daxService sets dle_ds_state on HAL; mirror into EffectDapController (cannot rely on
@@ -322,7 +326,7 @@ index b37dc6f..f979117 100644
 +            ALOGI("%s: playing pkg change, schedule music invalidate", __func__);
 +            scheduleSonyMusicRoutingInvalidate(
 +                    this, false,
-+                    property_get_int32("vendor.audio.invalidate_sleep_before", 100000));
++                    property_get_int32("persist.audio.invalidate_sleep_before", 100000));
 +        }
 +        if (sonyRoutingChanged) {
 +            sonyApplySonyRoutingHalState(filteredKeyValuePairs.c_str());
@@ -468,10 +472,10 @@ index 7655515..9981cdd 100644
      ~AudioFlinger() override;
 diff --git a/services/audioflinger/EffectDapController.cpp b/services/audioflinger/EffectDapController.cpp
 new file mode 100644
-index 0000000..26e71c2
+index 0000000..32e04b6
 --- /dev/null
 +++ b/services/audioflinger/EffectDapController.cpp
-@@ -0,0 +1,793 @@
+@@ -0,0 +1,804 @@
 +/*
 + * SPDX-License-Identifier: Apache-2.0
 + */
@@ -1193,13 +1197,24 @@ index 0000000..26e71c2
 +}
 +
 +void EffectDapController::runAfterRoutingUpdate() {
-+    if (!mInvalidateMusicAfterUnlock) {
++    bool pending = false;
++    {
++        Mutex::Autolock _l(mLock);
++        pending = mInvalidateMusicAfterUnlock;
++        mInvalidateMusicAfterUnlock = false;
++    }
++    if (!pending || mAudioFlinger == nullptr) {
 +        return;
 +    }
-+    mInvalidateMusicAfterUnlock = false;
-+    if (mAudioFlinger != nullptr) {
-+        mAudioFlinger->invalidateMusicTracksOnAllPlaybackThreads();
-+    }
++    // Do not take AudioFlinger_Mutex here. This path runs from the DMS
++    // connect callback inside AudioFlinger::moveEffectChain_ll(), which
++    // holds a ThreadBase_Mutex: AudioFlinger_Mutex (rank 8) may not be
++    // acquired while ThreadBase_Mutex (rank 13) is held, otherwise
++    // audio_utils::mutex aborts audioserver with
++    //   "pre_lock: invalid mutex order ... ThreadBase_Mutex > AudioFlinger_Mutex".
++    // Hand the invalidation to the dedicated routing-invalidate worker.
++    scheduleSonyMusicRoutingInvalidate(mAudioFlinger, true /*invalidateAll*/,
++                                       -1 /*sleepBeforeUsOverride*/);
 +}
 +
 +void EffectDapController::applyBypassState_l(bool dolbyOn) {
@@ -2017,14 +2032,14 @@ index 0000000..8854343
 +                                                           const android::String8& halOut);
 diff --git a/services/audioflinger/SonyRoutingInvalidate.cpp b/services/audioflinger/SonyRoutingInvalidate.cpp
 new file mode 100644
-index 0000000..76b8297
+index 0000000..2925257
 --- /dev/null
 +++ b/services/audioflinger/SonyRoutingInvalidate.cpp
 @@ -0,0 +1,140 @@
 +/*
 + * Stock libar-pal coalesces invalidate_out_track via a worker thread with
-+ * vendor.audio.invalidate_sleep_{before,after,dsee_on} and
-+ * vendor.audio.invalidate_skip to defer framework invalidate to HAL-only.
++ * persist.audio.invalidate_sleep_{before,after,dsee_on} and
++ * persist.audio.invalidate_skip to defer framework invalidate to HAL-only.
 + */
 +#define LOG_TAG "SonyRoutingInvalidate"
 +
@@ -2062,7 +2077,7 @@ index 0000000..76b8297
 +}
 +
 +bool sonyFrameworkInvalidateSkipped() {
-+    return property_get_bool("vendor.audio.invalidate_skip", false);
++    return property_get_bool("persist.audio.invalidate_skip", false);
 +}
 +
 +void* workerEntry(void* /*arg*/) {
@@ -2090,7 +2105,7 @@ index 0000000..76b8297
 +
 +        const int sleepBefore = sleepBeforeOverride >= 0
 +                ? sleepBeforeOverride
-+                : sonySleepUs("vendor.audio.invalidate_sleep_before", kDefaultSleepBeforeUs);
++                : sonySleepUs("persist.audio.invalidate_sleep_before", kDefaultSleepBeforeUs);
 +        if (sleepBefore > 0) {
 +            usleep(static_cast<useconds_t>(sleepBefore));
 +        }
@@ -2108,7 +2123,7 @@ index 0000000..76b8297
 +        }
 +
 +        const int sleepAfter =
-+                sonySleepUs("vendor.audio.invalidate_sleep_after", kDefaultSleepAfterUs);
++                sonySleepUs("persist.audio.invalidate_sleep_after", kDefaultSleepAfterUs);
 +        if (sleepAfter > 0 && gRequestId.load() == reqId) {
 +            usleep(static_cast<useconds_t>(sleepAfter));
 +        }

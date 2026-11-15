@@ -1,4 +1,4 @@
-From 2f3060b5ffe4a535e54ecf805d18ae7a26b2138d Mon Sep 17 00:00:00 2001
+From 8bed95f96965b724aa42108e0a38e0c6e5c34e7c Mon Sep 17 00:00:00 2001
 From: onlyfish <linotfish@outlook.com>
 Date: Thu, 12 Nov 2026 16:28:50 +0800
 Subject: [PATCH] audioflinger: keep the DAP controller lock off the HAL query

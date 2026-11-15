@@ -1,0 +1,244 @@
+From 67ebc7d3b665dfb37eb11e380b2540a90cf2038d Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Sun, 15 Nov 2026 18:02:24 +0800
+Subject: [PATCH] audioflinger: keep DAP pregain restart out of ThreadBase and
+ DMS init
+
+The DAP pregain restart runs on the mixer thread and used to hold
+ThreadBase_Mutex across the whole effect HAL sequence (stop, offload,
+configure, setDevice, configure, start). When the vendor HAL's
+EFFECT_CMD_SET_DEVICE did not return - libswdap's
+DapEffectContext::setDevice() synchronously calls IDms::setActiveDevice()
+and the dms service has a single RPC thread - createTrack() waited for
+ThreadBase_Mutex and tripped the TimeCheck:
+
+  TimeCheck timeout for IAudioFlinger::createTrack
+  pending EffectHalHidl::command ... tid <mixer thread>
+
+Snapshot outDeviceTypeAddrs() and the output-mix chain under
+ThreadBase_Mutex, then drop it before the HAL sequence. The effect chain
+mutex is still held for the whole sequence, so the reconfiguration stays
+serialized against effect processing, but a stuck HAL call can no longer
+block track creation.
+
+Also defer the restart until EffectDapDmsClient::isConnected() reports
+that registerClient() and the initial getIntParam() burst have completed,
+so the HAL's setActiveDevice() is not queued behind DsManager::init() on
+the dms single RPC thread.
+
+Log the queue/begin/end of the restart: if the crash recurs, logcat now
+shows which listener effect triggered it and whether the HAL call returned.
+
+Change-Id: I6f6f4e6d2c7b4f0e9d3a1b8c5e2f7a4d0c9b6e31
+
+Patch-series squash: absorbs 0016 (retarget a pending restart when the chain moves); content unchanged.
+
+Change-Id: Ic2fe4da68851056a7ee0872d4b201015636b9c20
+---
+ services/audioflinger/EffectDapController.cpp | 22 ++++++++++++++++
+ services/audioflinger/EffectDapDmsClient.cpp  | 11 ++++++++
+ services/audioflinger/EffectDapDmsClient.h    |  5 ++++
+ services/audioflinger/Effects.cpp             |  8 +++---
+ services/audioflinger/Effects.h               |  3 ++-
+ services/audioflinger/Threads.cpp             | 25 ++++++++++++++++---
+ 6 files changed, 65 insertions(+), 9 deletions(-)
+
+diff --git a/services/audioflinger/EffectDapController.cpp b/services/audioflinger/EffectDapController.cpp
+index 0fef20d..ab55d98 100644
+--- a/services/audioflinger/EffectDapController.cpp
++++ b/services/audioflinger/EffectDapController.cpp
+@@ -619,6 +619,12 @@ void EffectDapController::executePregainPrep_l(const sp<IAfPlaybackThread>& mlTh
+         mPendingMlForResync = mlThread;
+     }
+     mDapPregPrepPending.store(true, std::memory_order_release);
++    // Trigger log: either the global DAP effect was (re)created on the output
++    // mix, or a DLB volume-listener effect was created (normally the
++    // dlb_music_listener post-process effect when music playback starts). The
++    // mixer will run the global DAP restart on the next loop iteration.
++    ALOGI("%s() queue DAP pregain restart: mix io=%d track io=%d", __func__, dapThread->id(),
++            mlThread != nullptr ? mlThread->id() : -1);
+     ALOGV("%s() scheduled on mix io=%d", __func__, dapThread->id());
+ }
+ 
+@@ -638,6 +644,16 @@ bool EffectDapController::runPendingDapPregainOnMixThread(
+     if (!mDapPregPrepPending.load(std::memory_order_acquire)) {
+         return false;
+     }
++    // Do not issue the DAP HAL restart while the DMS client is still
++    // registering. registerClient() runs DsManager::init() on the dms service's
++    // single RPC thread, and DapEffectContext::setDevice() synchronously calls
++    // IDms::setActiveDevice(); issuing the restart now would queue that call
++    // behind the initialization while the mixer holds ThreadBase_Mutex.
++    // mDapPregPrepPending stays set, so the restart runs on a later loop once
++    // the DMS worker reports the registration.
++    if (mDmsClient == nullptr || !mDmsClient->isConnected()) {
++        return false;
++    }
+     sp<IAfPlaybackThread> trackThread;
+     {
+         Mutex::Autolock _l(mLock);
+@@ -711,6 +727,12 @@ void EffectDapController::onGlobalMixChainAttached(
+                 break;
+             }
+         }
++        // A pregain restart queued for the previous DAP thread must follow the
++        // output-mix chain: the old thread no longer has that chain and would
++        // skip the restart (prepareDapPregainForTrackThread: mixChain=null).
++        if (mDapPregPrepPending.load(std::memory_order_acquire)) {
++            mPendingDapPregPrep = thread;
++        }
+     }
+     connectDmsIfNeeded(threadBase);
+     runDeferredPregainPrep();
+diff --git a/services/audioflinger/EffectDapDmsClient.cpp b/services/audioflinger/EffectDapDmsClient.cpp
+index 13dd472..a490194 100644
+--- a/services/audioflinger/EffectDapDmsClient.cpp
++++ b/services/audioflinger/EffectDapDmsClient.cpp
+@@ -136,6 +136,15 @@ status_t EffectDapDmsClient::connect(audio_session_t sessionId, audio_io_handle_
+     // EffectDapController lock and must never nest inside the DMS lock (the
+     // controller lock is taken while disconnecting, which is the reverse order).
+     refreshCachedState();
++    // Only now is the dms service done with registerClient()/DsManager::init()
++    // and the initial getIntParam() burst: the DAP restart may issue
++    // IDms::setActiveDevice() without queueing behind them.
++    {
++        Mutex::Autolock _l(mLock);
++        if (mRegistered) {
++            mConnected.store(true, std::memory_order_release);
++        }
++    }
+     return NO_ERROR;
+ }
+ 
+@@ -178,6 +187,7 @@ void EffectDapDmsClient::onServiceDied() {
+             mHidl->service.clear();
+         }
+         mRegistered = false;
++        mConnected.store(false, std::memory_order_release);
+         cb = mOnServiceDied;
+     }
+     // Outside mLock: the controller re-queues a connection attempt.
+@@ -187,6 +197,7 @@ void EffectDapDmsClient::onServiceDied() {
+ }
+ 
+ void EffectDapDmsClient::disconnectLocked() {
++    mConnected.store(false, std::memory_order_release);
+     if (!mRegistered || mHidl == nullptr || mHidl->service == nullptr ||
+             mHidl->callbacks == nullptr) {
+         mRegistered = false;
+diff --git a/services/audioflinger/EffectDapDmsClient.h b/services/audioflinger/EffectDapDmsClient.h
+index bf033d4..8a3053b 100644
+--- a/services/audioflinger/EffectDapDmsClient.h
++++ b/services/audioflinger/EffectDapDmsClient.h
+@@ -7,6 +7,7 @@
+ #include <system/audio.h>
+ #include <utils/Mutex.h>
+ 
++#include <atomic>
+ #include <functional>
+ #include <memory>
+ #include <vector>
+@@ -28,6 +29,9 @@ public:
+     status_t connect(audio_session_t sessionId, audio_io_handle_t ioHandle);
+     void disconnect();
+     void refreshCachedState();
++    // Lock-free: read from the mixer thread without touching mLock, which
++    // connect() holds across the synchronous registerClient() HIDL call.
++    bool isConnected() const { return mConnected.load(std::memory_order_acquire); }
+     // Detaches the HIDL callbacks from this object before it is destroyed.
+     void detach();
+ 
+@@ -48,6 +52,7 @@ private:
+     audio_session_t mSessionId = AUDIO_SESSION_NONE;
+     audio_io_handle_t mIoHandle = AUDIO_IO_HANDLE_NONE;
+     bool mRegistered = false;
++    std::atomic<bool> mConnected{false};
+ };
+ 
+ } // namespace android
+diff --git a/services/audioflinger/Effects.cpp b/services/audioflinger/Effects.cpp
+index 287ac79..a8452fe 100644
+--- a/services/audioflinger/Effects.cpp
++++ b/services/audioflinger/Effects.cpp
+@@ -3972,13 +3972,11 @@ void DeviceEffectProxy::ProxyCallback::onEffectDisable(
+ 
+ void restartGlobalDapEffectForPregain(const sp<IAfEffectModule>& effect,
+                                       const sp<IAfEffectChain>& mixChain,
+-                                      const sp<IAfPlaybackThread>& hostThread) {
+-    if (effect == nullptr || mixChain == nullptr || hostThread == nullptr) {
++                                      const AudioDeviceTypeAddrVector& devices,
++                                      audio_io_handle_t io) {
++    if (effect == nullptr || mixChain == nullptr) {
+         return;
+     }
+-    // Read thread state while caller holds PlaybackThread::mutex().
+-    const AudioDeviceTypeAddrVector devices = hostThread->outDeviceTypeAddrs();
+-    const audio_io_handle_t io = hostThread->id();
+ 
+     EffectModule* module = static_cast<EffectModule*>(effect.get());
+     audio_utils::lock_guard chainLock(mixChain->mutex());
+diff --git a/services/audioflinger/Effects.h b/services/audioflinger/Effects.h
+index f06769d..cb1c9d4 100644
+--- a/services/audioflinger/Effects.h
++++ b/services/audioflinger/Effects.h
+@@ -917,6 +917,7 @@ private:
+ 
+ void restartGlobalDapEffectForPregain(const sp<IAfEffectModule>& effect,
+                                       const sp<IAfEffectChain>& mixChain,
+-                                      const sp<IAfPlaybackThread>& hostThread);
++                                      const AudioDeviceTypeAddrVector& devices,
++                                      audio_io_handle_t io);
+ 
+ } // namespace android
+diff --git a/services/audioflinger/Threads.cpp b/services/audioflinger/Threads.cpp
+index 5dafbd3..3fef79b 100644
+--- a/services/audioflinger/Threads.cpp
++++ b/services/audioflinger/Threads.cpp
+@@ -6570,13 +6570,26 @@ uint32_t PlaybackThread::trackCountForUid_l(uid_t uid) const
+ 
+ void PlaybackThread::prepareDapPregainForTrackThread(
+         const sp<IAfPlaybackThread>& trackThread) {
+-    audio_utils::lock_guard _l(mutex());
+     EffectDapController* ctrl = EffectDapController::instance();
+     if (ctrl == nullptr) {
+         return;
+     }
++    // Snapshot the thread state under ThreadBase_Mutex, then drop it before the
++    // DAP HAL reconfiguration. The sequence in restartGlobalDapEffectForPregain()
++    // is a synchronous HIDL round trip to the effect HAL and can block for
++    // seconds; holding ThreadBase_Mutex across it makes every createTrack() wait
++    // and trips the TimeCheck:
++    //   TimeCheck timeout for IAudioFlinger::createTrack
++    // The effect chain mutex is still held for the whole sequence, which is what
++    // serializes the reconfiguration against effect processing.
++    AudioDeviceTypeAddrVector devices;
++    sp<IAfEffectChain> mixChain;
++    {
++        audio_utils::lock_guard _l(mutex());
++        devices = outDeviceTypeAddrs();
++        mixChain = getEffectChain_l(AUDIO_SESSION_OUTPUT_MIX);
++    }
+     const sp<IAfEffectModule> dap = ctrl->globalDapEffect();
+-    const sp<IAfEffectChain> mixChain = getEffectChain_l(AUDIO_SESSION_OUTPUT_MIX);
+     const sp<IAfPlaybackThread> ioThread =
+             trackThread != nullptr ? trackThread : asIAfPlaybackThread();
+     if (dap == nullptr || mixChain == nullptr || ioThread == nullptr) {
+@@ -6584,8 +6597,14 @@ void PlaybackThread::prepareDapPregainForTrackThread(
+                 ioThread != nullptr ? ioThread->id() : -1, dap.get(), mixChain.get());
+         return;
+     }
+-    restartGlobalDapEffectForPregain(dap, mixChain, ioThread);
++    const nsecs_t startNs = systemTime();
++    ALOGI("%s() DAP pregain restart begin: mix io=%d track io=%d", __func__, id(),
++            ioThread->id());
++    restartGlobalDapEffectForPregain(dap, mixChain, devices, ioThread->id());
+     ctrl->finishDapRestartOnHostThread();
++    const nsecs_t elapsedMs = (systemTime() - startNs) / 1000000;
++    ALOGI("%s() DAP pregain restart end: mix io=%d track io=%d elapsed=%lldms", __func__,
++            id(), ioThread->id(), (long long)elapsedMs);
+     ALOGV("%s() track io=%d mix io=%d", __func__, ioThread->id(), id());
+ }
+ 
+-- 
+2.53.0
+

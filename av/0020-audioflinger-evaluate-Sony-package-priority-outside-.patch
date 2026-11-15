@@ -1,0 +1,221 @@
+From 209969e2f9f13d669b453b4d0822ed2b870fe4c1 Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Sun, 15 Nov 2026 14:20:43 +0800
+Subject: [PATCH] audioflinger: evaluate Sony package priority outside the
+ controller lock
+
+EffectDapController::isPkgPrioritized() calls
+PermissionController::getPackageUid() for every entry of the prioritized
+list, and all three callers ran it with mLock held. That is a binder call
+to package manager, which can block while the mixer thread needs mLock:
+
+  onUpmixPlayingPkg(): mLock -> PermissionController
+  mixer:               ThreadBase_Mutex -> mLock
+
+Split all three paths into snapshot / evaluate / commit:
+
+- Apply the event and bump mPkgStateGeneration under mLock; copy the
+  playing package, uid and both SOMC lists.
+- Run isPkgPrioritized() and queryUpmixSupportedPkg() with no lock held.
+- Re-check the generation before committing. A callback that lost the
+  race (for example onSomcAppLists() firing prioritized then excluded)
+  drops its result instead of overwriting the newer state.
+
+While restructuring, fix the cache control flow: onUpmixPlayingPkg()
+computed the HAL cache result and then unconditionally overwrote it with
+`supported = prioritized`, so a cached "supported" answer was turned
+back into false on every cache hit. The list, cache and HAL sources are
+now mutually exclusive, and only an actual HAL query updates
+mUpmixQuery*.
+
+Still under mLock as before: updateEffectPriority_l(),
+finishRoutingUpdate_l() and the state commit. runAfterRoutingUpdate()
+stays outside.
+
+Change-Id: I9d3f7b2a5c8e1f6d4a0b9c7e3f5a2d8b6c1e4f90
+---
+ services/audioflinger/EffectDapController.cpp | 98 +++++++++++++------
+ services/audioflinger/EffectDapController.h   |  4 +
+ 2 files changed, 73 insertions(+), 29 deletions(-)
+
+diff --git a/services/audioflinger/EffectDapController.cpp b/services/audioflinger/EffectDapController.cpp
+index ab55d98..24e0178 100644
+--- a/services/audioflinger/EffectDapController.cpp
++++ b/services/audioflinger/EffectDapController.cpp
+@@ -455,11 +455,12 @@ void EffectDapController::on360RaContents(bool active) {
+ }
+ 
+ void EffectDapController::onUpmixPlayingPkg(uid_t uid, const char* packageName) {
+-    bool prioritized;
++    std::string pkgName;
++    std::vector<std::string> prioritizedApps;
++    std::vector<std::string> excludedApps;
+     bool cached = false;
+-    bool supported = false;
+-    uid_t queryUid = static_cast<uid_t>(-1);
+-    std::string queryPkg;
++    bool cachedResult = false;
++    uint32_t generation;
+     {
+         Mutex::Autolock _l(mLock);
+         mPlayingPkgUid = uid;
+@@ -470,31 +471,46 @@ void EffectDapController::onUpmixPlayingPkg(uid_t uid, const char* packageName)
+             mPlayingPkgName.clear();
+             ALOGI("%s: uid=%u", __func__, uid);
+         }
+-        prioritized = isPkgPrioritized(mPlayingPkgName, mPlayingPkgUid,
+-                                       mPrioritizedApps, mExcludedApps);
+-        if (!prioritized && mUpmixQueryValid && mUpmixQueryUid == mPlayingPkgUid &&
++        ++mPkgStateGeneration;
++        generation = mPkgStateGeneration;
++        pkgName = mPlayingPkgName;
++        prioritizedApps = mPrioritizedApps;
++        excludedApps = mExcludedApps;
++        if (mUpmixQueryValid && mUpmixQueryUid == mPlayingPkgUid &&
+                 mUpmixQueryPkg == mPlayingPkgName) {
+-            supported = mUpmixQueryResult;
+             cached = true;
++            cachedResult = mUpmixQueryResult;
+         }
+-        queryUid = mPlayingPkgUid;
+-        queryPkg = mPlayingPkgName;
+     }
+-    supported = prioritized;
+-    if (!prioritized && !cached) {
+-        // HAL query and the package-manager lookup run outside mLock, see
+-        // queryUpmixSupportedPkg().
++
++    // Package-manager lookups and the HAL query run outside mLock, see
++    // queryUpmixSupportedPkg().
++    const bool prioritized = isPkgPrioritized(pkgName, uid, prioritizedApps, excludedApps);
++    bool supported;
++    bool queriedHal = false;
++    if (prioritized) {
++        supported = true;
++    } else if (cached) {
++        supported = cachedResult;
++    } else {
+         supported = queryUpmixSupportedPkg(false);
+-        Mutex::Autolock _l(mLock);
+-        mUpmixQueryUid = queryUid;
+-        mUpmixQueryPkg = queryPkg;
+-        mUpmixQueryValid = true;
+-        mUpmixQueryResult = supported;
++        queriedHal = true;
+     }
++
+     char value[PROPERTY_VALUE_MAX] = {};
+     property_get(kDolbyEnabledProp, value, "0");
+     {
+         Mutex::Autolock _l(mLock);
++        if (mPkgStateGeneration != generation) {
++            // A newer package or list event superseded this evaluation.
++            return;
++        }
++        if (queriedHal) {
++            mUpmixQueryUid = uid;
++            mUpmixQueryPkg = pkgName;
++            mUpmixQueryValid = true;
++            mUpmixQueryResult = supported;
++        }
+         mUpmixSupportedPkg = supported;
+         updateEffectPriority_l();
+         const bool dolbyOn = mDolbyHalOn || parseDolbyEnabledProp(value);
+@@ -504,7 +520,11 @@ void EffectDapController::onUpmixPlayingPkg(uid_t uid, const char* packageName)
+ }
+ 
+ void EffectDapController::onSomcPrioritizedApps(const char* prioritizedApps) {
+-    bool prioritized;
++    std::string pkgName;
++    uid_t uid;
++    std::vector<std::string> prioritized;
++    std::vector<std::string> excluded;
++    uint32_t generation;
+     {
+         Mutex::Autolock _l(mLock);
+         // SE thoat Effect Priority van SetParameters cung list — khong invalidate neu khong doi
+@@ -515,14 +535,22 @@ void EffectDapController::onSomcPrioritizedApps(const char* prioritizedApps) {
+         mPrioritizedApps = std::move(next);
+         ALOGI("%s: prioritized=%zu playing_pkg=%s", __func__, mPrioritizedApps.size(),
+               mPlayingPkgName.empty() ? "(none)" : mPlayingPkgName.c_str());
+-        prioritized = isPkgPrioritized(mPlayingPkgName, mPlayingPkgUid,
+-                                       mPrioritizedApps, mExcludedApps);
+-    }
+-    const bool supported = queryUpmixSupportedPkg(prioritized);
++        ++mPkgStateGeneration;
++        generation = mPkgStateGeneration;
++        pkgName = mPlayingPkgName;
++        uid = mPlayingPkgUid;
++        prioritized = mPrioritizedApps;
++        excluded = mExcludedApps;
++    }
++    const bool pkgPrioritized = isPkgPrioritized(pkgName, uid, prioritized, excluded);
++    const bool supported = queryUpmixSupportedPkg(pkgPrioritized);
+     char value[PROPERTY_VALUE_MAX] = {};
+     property_get(kDolbyEnabledProp, value, "0");
+     {
+         Mutex::Autolock _l(mLock);
++        if (mPkgStateGeneration != generation) {
++            return;
++        }
+         mUpmixSupportedPkg = supported;
+         updateEffectPriority_l();
+         const bool dolbyOn = mDolbyHalOn || parseDolbyEnabledProp(value);
+@@ -533,7 +561,11 @@ void EffectDapController::onSomcPrioritizedApps(const char* prioritizedApps) {
+ }
+ 
+ void EffectDapController::onSomcExcludedApps(const char* excludedApps) {
+-    bool prioritized;
++    std::string pkgName;
++    uid_t uid;
++    std::vector<std::string> prioritized;
++    std::vector<std::string> excluded;
++    uint32_t generation;
+     {
+         Mutex::Autolock _l(mLock);
+         // SE thoat Effect Priority van SetParameters cung list — khong invalidate neu khong doi
+@@ -544,14 +576,22 @@ void EffectDapController::onSomcExcludedApps(const char* excludedApps) {
+         mExcludedApps = std::move(next);
+         ALOGI("%s: excluded=%zu playing_pkg=%s", __func__, mExcludedApps.size(),
+               mPlayingPkgName.empty() ? "(none)" : mPlayingPkgName.c_str());
+-        prioritized = isPkgPrioritized(mPlayingPkgName, mPlayingPkgUid,
+-                                       mPrioritizedApps, mExcludedApps);
+-    }
+-    const bool supported = queryUpmixSupportedPkg(prioritized);
++        ++mPkgStateGeneration;
++        generation = mPkgStateGeneration;
++        pkgName = mPlayingPkgName;
++        uid = mPlayingPkgUid;
++        prioritized = mPrioritizedApps;
++        excluded = mExcludedApps;
++    }
++    const bool pkgPrioritized = isPkgPrioritized(pkgName, uid, prioritized, excluded);
++    const bool supported = queryUpmixSupportedPkg(pkgPrioritized);
+     char value[PROPERTY_VALUE_MAX] = {};
+     property_get(kDolbyEnabledProp, value, "0");
+     {
+         Mutex::Autolock _l(mLock);
++        if (mPkgStateGeneration != generation) {
++            return;
++        }
+         mUpmixSupportedPkg = supported;
+         updateEffectPriority_l();
+         const bool dolbyOn = mDolbyHalOn || parseDolbyEnabledProp(value);
+diff --git a/services/audioflinger/EffectDapController.h b/services/audioflinger/EffectDapController.h
+index 0e47d00..1329655 100644
+--- a/services/audioflinger/EffectDapController.h
++++ b/services/audioflinger/EffectDapController.h
+@@ -116,6 +116,10 @@ private:
+     std::string mUpmixQueryPkg;
+     bool mUpmixQueryValid = false;
+     bool mUpmixQueryResult = false;
++    // Bumped on every playing package / SOMC list change. Package priority is
++    // evaluated outside mLock (PermissionController + HAL), so a result that
++    // was computed from a superseded snapshot must not be committed.
++    uint32_t mPkgStateGeneration = 0;
+     std::vector<std::string> mPrioritizedApps;
+     std::vector<std::string> mExcludedApps;
+     wp<IAfPlaybackThread> mDapPlaybackThread;
+-- 
+2.53.0
+

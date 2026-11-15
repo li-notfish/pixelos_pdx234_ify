@@ -1,0 +1,655 @@
+From 92e570d6d0ca5fb13e60bcac3ac49027f7c17604 Mon Sep 17 00:00:00 2001
+From: onlyfish <linotfish@outlook.com>
+Date: Sun, 15 Nov 2026 18:02:24 +0800
+Subject: [PATCH] audiopolicy: move Sony HAL reads and writes off the policy
+ lock
+
+Every Sony HAL getParameters()/setParameters() in the policy layer ran
+while AudioPolicyService_Mutex was held. The reads were cached for 200 ms
+but a cache miss still performed a synchronous HIDL round trip, and all
+three Sony writes used delayMs=0, which waits for ApmAudio to run
+AudioSystem::setParameters(). A slow audio HAL therefore blocked every
+binder thread that needed the policy lock:
+
+  getStreamTypeForAttributes -> AudioPolicyService_Mutex
+    -> sonySet360RaContents -> AudioCommandThread::sendCommand
+
+Add a managerdefault-local FIFO worker and turn the cache into
+stale-while-revalidate:
+
+- Write, Refresh and ReassertPlayingPkg tasks share one ordered queue.
+  The producer only touches the queue under a leaf mutex; the worker runs
+  client->getParameters()/setParameters() with no policy lock held and
+  exits once the queue drains.
+- sonyGetHalParamCached() now returns the cached value (possibly expired)
+  or a miss, and queues a refresh. A missing or failed read no longer
+  stalls the caller; callers keep their existing property/default
+  fallbacks. A refresh re-checks the entry before storing, so a
+  write-through or another refresh wins.
+- sonySet360RaContents() writes 360ra_contents through to the cache
+  instead of dropping the whole cache.
+- sonyNotifyPlayingPkgUid() stashes the package and queues the write plus
+  forced refreshes of isUpmixSupportedPkg / is_dsee_prioritized after it.
+  If a refresh observes a changed value it replays the stashed
+  playing_pkg, which makes AudioFlinger schedule one more routing
+  evaluation against the fresh state, then stops (no change, no replay).
+- The two AudioPolicyManager invalidate entry points mark the cache stale
+  before evaluating, so an AudioFlinger-triggered re-evaluation does not
+  keep using a value that is younger than the TTL but older than the
+  event.
+
+sonyInvalidateHalCache() (full clear) is replaced by
+sonyMarkHalCacheStale(), which keeps the previous snapshot available to
+callers that evaluate before the refresh lands.
+
+Known residual: sonyPackageNameForUid() can still call
+PermissionController::getPackagesForUid() under the policy lock; separate
+follow-up.
+
+Change-Id: I5e1c8a3f7d2b9e4a6c0f8d1b3e7a5c9f2d4b6e18
+
+Patch-series squash: absorbs 0014 (HAL read cache) and 0022 (String8 build fix); content unchanged.
+
+Change-Id: I2ca68498169116432854a7ff9f3277678edcc22a
+---
+ .../include/media/SonyDseeCodecClient.h       |  28 +-
+ .../managerdefault/AudioPolicyManager.cpp     |   2 +
+ .../managerdefault/Sony360RAudioPolicy.cpp    |  91 ++++--
+ .../managerdefault/SonyDolbyAudioPolicy.cpp   | 284 +++++++++++++++++-
+ .../managerdefault/SonyDolbyAudioPolicy.h     |  16 +
+ 5 files changed, 380 insertions(+), 41 deletions(-)
+
+diff --git a/media/libaudioclient/include/media/SonyDseeCodecClient.h b/media/libaudioclient/include/media/SonyDseeCodecClient.h
+index f77602f..d7b1d2e 100644
+--- a/media/libaudioclient/include/media/SonyDseeCodecClient.h
++++ b/media/libaudioclient/include/media/SonyDseeCodecClient.h
+@@ -13,6 +13,8 @@
+ #include <utils/Log.h>
+ #include <strings.h>
+ 
++#include <mutex>
++
+ namespace android {
+ 
+ inline audio_format_t sonyDseeMimeToFormat(const char* mime) {
+@@ -43,14 +45,36 @@ inline void sonyDseeNotifyCodecClient(uid_t uid, const char* mime, int32_t bitra
+         return;
+     }
+     const audio_format_t fmt = sonyDseeMimeToFormat(mime);
++    const int32_t clampedBitrate = bitrate > 0 ? bitrate : 0;
++    {
++        // AudioSystem::setParameters() is a synchronous round trip to
++        // audioserver: skip it when nothing changed (codecs are reconfigured a
++        // lot with identical parameters).
++        static std::mutex sLock;
++        static bool sValid = false;
++        static uid_t sUid = 0;
++        static audio_format_t sFormat = AUDIO_FORMAT_DEFAULT;
++        static int32_t sBitrate = -1;
++        static bool sOn = false;
++        std::lock_guard<std::mutex> lock(sLock);
++        if (sValid && sUid == uid && sFormat == fmt && sBitrate == clampedBitrate &&
++                sOn == on) {
++            return;
++        }
++        sValid = true;
++        sUid = uid;
++        sFormat = fmt;
++        sBitrate = clampedBitrate;
++        sOn = on;
++    }
+     AudioParameter param;
+     param.addInt(String8("codec_client_uid"), static_cast<int>(uid));
+     param.addInt(String8("codec_client_state"), on ? 1 : 0);
+     param.addInt(String8("codec_format"), static_cast<int>(fmt));
+-    param.addInt(String8("codec_bitrate"), bitrate > 0 ? bitrate : 0);
++    param.addInt(String8("codec_bitrate"), clampedBitrate);
+     const status_t st = AudioSystem::setParameters(param.toString());
+     ALOGD("SonyDseeCodecClient uid=%u mime=%s fmt=0x%x br=%d on=%d st=%d",
+-          static_cast<unsigned>(uid), mime, fmt, bitrate, on ? 1 : 0, st);
++          static_cast<unsigned>(uid), mime, fmt, clampedBitrate, on ? 1 : 0, st);
+ }
+ 
+ }  // namespace android
+diff --git a/services/audiopolicy/managerdefault/AudioPolicyManager.cpp b/services/audiopolicy/managerdefault/AudioPolicyManager.cpp
+index 7c4dcac..099d89c 100644
+--- a/services/audiopolicy/managerdefault/AudioPolicyManager.cpp
++++ b/services/audiopolicy/managerdefault/AudioPolicyManager.cpp
+@@ -10180,6 +10180,7 @@ PortHandleVector AudioPolicyManager::getClientsForStream(
+ }
+ 
+ void AudioPolicyManager::sonyInvalidateAllMusicTracks() {
++    sonyMarkHalCacheStale();
+     const bool dolbyOn = sonyDolbyEnabled(mpClientInterface);
+     const bool dseeOn = sonyDseeHxEnabled(mpClientInterface);
+     ALOGI("%s: dolby=%d dsee=%d", __func__, dolbyOn ? 1 : 0, dseeOn ? 1 : 0);
+@@ -10187,6 +10188,7 @@ void AudioPolicyManager::sonyInvalidateAllMusicTracks() {
+ }
+ 
+ void AudioPolicyManager::sonyInvalidateMismatchedMusicTracks() {
++    sonyMarkHalCacheStale();
+     const bool dolbyOn = sonyDolbyEnabled(mpClientInterface);
+     const bool dseeOn = sonyDseeHxEnabled(mpClientInterface);
+     PortHandleVector clientsToInvalidate;
+diff --git a/services/audiopolicy/managerdefault/Sony360RAudioPolicy.cpp b/services/audiopolicy/managerdefault/Sony360RAudioPolicy.cpp
+index 68a9676..5d399ac 100644
+--- a/services/audiopolicy/managerdefault/Sony360RAudioPolicy.cpp
++++ b/services/audiopolicy/managerdefault/Sony360RAudioPolicy.cpp
+@@ -10,8 +10,11 @@
+ #include <binder/PermissionController.h>
+ #include <fstream>
+ #include <limits>
++#include <map>
++#include <mutex>
+ #include <string>
+ #include <utils/Log.h>
++#include <utils/Timers.h>
+ 
+ #include "AudioPolicyInterface.h"
+ #include "SonyDolbyAudioPolicy.h"
+@@ -23,16 +26,23 @@ namespace {
+ constexpr uint32_t kSony360RaMaskBase = 0x72f000U;
+ constexpr uint32_t kSony360RaMaskMaxDelta = 0x607U;
+ 
++// startOutput() calls sonySet360RaContents() for every stream; the HAL state is
++// global and idempotent, so coalesce identical notifications in a short window
++// instead of paying a synchronous parametersCommand each time.
++constexpr nsecs_t k360RaDedupeWindowNs = 500 * 1000000LL;
++std::mutex g360RaSendMutex;
++int gLast360RaContents = -1;
++nsecs_t gLast360RaSendNs = 0;
++
++// uid -> package name, resolved through PermissionController (a binder call to
++// system_server) plus a /data/system/packages.list fallback.
++std::mutex gPkgNameMutex;
++std::map<uid_t, std::string> gPkgNameCache;
++
+ bool sonyGetHalInt(AudioPolicyClientInterface* client, const char* key, int* value) {
+-    if (client == nullptr || key == nullptr || value == nullptr) {
+-        return false;
+-    }
+-    const String8 result = client->getParameters(AUDIO_IO_HANDLE_NONE, String8(key));
+-    if (result.length() == 0) {
+-        return false;
+-    }
+-    AudioParameter param(result);
+-    return param.getInt(String8(key), *value) == NO_ERROR;
++    // Cached: every read is a synchronous HIDL round trip made under
++    // AudioPolicyService_Mutex.
++    return sonyGetHalIntCached(client, key, value);
+ }
+ 
+ uint32_t sonyChannelCount(audio_channel_mask_t mask) {
+@@ -110,25 +120,38 @@ std::string sonyPackageNameForUid(uid_t uid) {
+     if (uid == 0 || uid == static_cast<uid_t>(-1)) {
+         return {};
+     }
++    {
++        std::lock_guard<std::mutex> lock(gPkgNameMutex);
++        const auto it = gPkgNameCache.find(uid);
++        if (it != gPkgNameCache.end()) {
++            return it->second;
++        }
++    }
++    std::string resolved;
+     Vector<String16> packages;
+     PermissionController permissionController;
+     permissionController.getPackagesForUid(uid, packages);
+     if (!packages.isEmpty()) {
+-        return String8(packages[0]).c_str();
+-    }
+-    std::ifstream packagesFile("/data/system/packages.list");
+-    if (!packagesFile.is_open()) {
+-        return {};
+-    }
+-    std::string package;
+-    uid_t pkgUid = static_cast<uid_t>(-1);
+-    while (packagesFile >> package >> pkgUid) {
+-        if (pkgUid == uid) {
+-            return package;
++        resolved = String8(packages[0]).c_str();
++    } else {
++        std::ifstream packagesFile("/data/system/packages.list");
++        if (packagesFile.is_open()) {
++            std::string package;
++            uid_t pkgUid = static_cast<uid_t>(-1);
++            while (packagesFile >> package >> pkgUid) {
++                if (pkgUid == uid) {
++                    resolved = package;
++                    break;
++                }
++                packagesFile.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
++            }
+         }
+-        packagesFile.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+     }
+-    return {};
++    if (!resolved.empty()) {
++        std::lock_guard<std::mutex> lock(gPkgNameMutex);
++        gPkgNameCache[uid] = resolved;
++    }
++    return resolved;
+ }
+ 
+ bool sonyIsUpmixApplicable(AudioPolicyClientInterface* client) {
+@@ -202,7 +225,7 @@ void sony360RaAdjustOutputFlags(AudioPolicyClientInterface* client, audio_stream
+     if (sony360RaEnabled() && sonyIs360RaChannelMask(config->channel_mask)) {
+         const audio_output_flags_t before = *flags;
+         sony360RaForceMixerRoutingFlags(flags);
+-        ALOGI("%s: native 360RA mask 0x%x, flags 0x%x -> 0x%x", __func__,
++        ALOGV("%s: native 360RA mask 0x%x, flags 0x%x -> 0x%x", __func__,
+               config->channel_mask, before, *flags);
+         return;
+     }
+@@ -210,7 +233,7 @@ void sony360RaAdjustOutputFlags(AudioPolicyClientInterface* client, audio_stream
+     if (sony360RaUpmixModeActive(client) && sonyChannelCount(config->channel_mask) <= 2) {
+         const audio_output_flags_t before = *flags;
+         sony360RaForceMixerRoutingFlags(flags);
+-        ALOGI("%s: 360RA upmix mode active, stereo flags 0x%x -> 0x%x", __func__, before, *flags);
++        ALOGV("%s: 360RA upmix mode active, stereo flags 0x%x -> 0x%x", __func__, before, *flags);
+         return;
+     }
+     if (!sonyCheckUpmixIsApplicable(client, stream, config, *flags)) {
+@@ -230,10 +253,22 @@ void sonySet360RaContents(AudioPolicyClientInterface* client, bool active) {
+     if (client == nullptr || !sony360RaEnabled()) {
+         return;
+     }
++    const int value = active ? 1 : 0;
++    const nsecs_t now = systemTime(CLOCK_MONOTONIC);
++    {
++        std::lock_guard<std::mutex> lock(g360RaSendMutex);
++        if (value == gLast360RaContents && (now - gLast360RaSendNs) < k360RaDedupeWindowNs) {
++            ALOGV("%s: 360ra_contents=%d unchanged, skip", __func__, value);
++            return;
++        }
++        gLast360RaContents = value;
++        gLast360RaSendNs = now;
++    }
++    sonyStoreHalCacheValue("360ra_contents", String8::format("360ra_contents=%d", value));
+     AudioParameter param;
+-    param.addInt(String8("360ra_contents"), active ? 1 : 0);
+-    ALOGI("%s: 360ra_contents=%d", __func__, active ? 1 : 0);
+-    client->setParameters(AUDIO_IO_HANDLE_NONE, param.toString());
++    param.addInt(String8("360ra_contents"), value);
++    ALOGI("%s: 360ra_contents=%d", __func__, value);
++    sonyQueueHalParameterWrite(client, param.toString());
+ }
+ 
+ void sonyUpdate360RaContentsForConfig(AudioPolicyClientInterface* client,
+@@ -281,7 +316,7 @@ void sonyNotifyUpmixPlayingPkg(AudioPolicyClientInterface* client, audio_io_hand
+     param.addInt(String8("chk_upmix_playing_pkg_uid"), static_cast<int>(uid));
+     ALOGI("%s: uid=%u pkg=%s", __func__, uid,
+           package.empty() ? "(unknown)" : package.c_str());
+-    client->setParameters(AUDIO_IO_HANDLE_NONE, param.toString());
++    sonyQueueHalParameterWrite(client, param.toString());
+ }
+ 
+ }  // namespace android
+diff --git a/services/audiopolicy/managerdefault/SonyDolbyAudioPolicy.cpp b/services/audiopolicy/managerdefault/SonyDolbyAudioPolicy.cpp
+index 602ec56..54ea659 100644
+--- a/services/audiopolicy/managerdefault/SonyDolbyAudioPolicy.cpp
++++ b/services/audiopolicy/managerdefault/SonyDolbyAudioPolicy.cpp
+@@ -10,8 +10,15 @@
+ #include <cutils/properties.h>
+ #include <strings.h>
+ #include <utils/Log.h>
++#include <utils/Timers.h>
+ 
+ #include <cstring>
++#include <deque>
++#include <map>
++#include <mutex>
++#include <set>
++#include <string>
++#include <thread>
+ 
+ #include "AudioPolicyInterface.h"
+ 
+@@ -19,6 +26,36 @@ namespace android {
+ 
+ namespace {
+ 
++// Short-lived cache for HAL parameter reads. Values change only when the user
++// toggles an effect or the playing package changes, both of which are slower
++// than the TTL; explicit invalidation covers the paths we drive ourselves.
++constexpr nsecs_t kHalCacheTtlNs = 200 * 1000000LL;  // 200 ms
++
++struct HalCacheEntry {
++    String8 value;
++    nsecs_t expireNs = 0;
++};
++
++std::mutex gHalCacheMutex;
++std::map<std::string, HalCacheEntry> gHalCache;
++
++nsecs_t halCacheNowNs() {
++    return systemTime(CLOCK_MONOTONIC);
++}
++
++bool sonyLookupHalCache(const char* key, String8* out, bool* stale) {
++    const nsecs_t now = halCacheNowNs();
++    std::lock_guard<std::mutex> lock(gHalCacheMutex);
++    const auto it = gHalCache.find(key);
++    if (it == gHalCache.end()) {
++        *stale = true;
++        return false;
++    }
++    *out = it->second.value;
++    *stale = now >= it->second.expireNs;
++    return true;
++}
++
+ bool sonyParseHalBool(const AudioParameter& param, const char* key, bool* out) {
+     int value = 0;
+     if (param.getInt(String8(key), value) == NO_ERROR) {
+@@ -34,22 +71,16 @@ bool sonyParseHalBool(const AudioParameter& param, const char* key, bool* out) {
+ }
+ 
+ bool sonyGetHalBool(AudioPolicyClientInterface* client, const char* key, bool* out) {
+-    if (client == nullptr || key == nullptr || out == nullptr) {
+-        return false;
+-    }
+-    const String8 result = client->getParameters(AUDIO_IO_HANDLE_NONE, String8(key));
+-    if (result.length() == 0) {
++    String8 result;
++    if (!sonyGetHalParamCached(client, key, &result) || result.length() == 0) {
+         return false;
+     }
+     return sonyParseHalBool(AudioParameter(result), key, out);
+ }
+ 
+ bool sonyGetHalInt(AudioPolicyClientInterface* client, const char* key, int* value) {
+-    if (client == nullptr || key == nullptr || value == nullptr) {
+-        return false;
+-    }
+-    const String8 result = client->getParameters(AUDIO_IO_HANDLE_NONE, String8(key));
+-    if (result.length() == 0) {
++    String8 result;
++    if (!sonyGetHalParamCached(client, key, &result) || result.length() == 0) {
+         return false;
+     }
+     AudioParameter param(result);
+@@ -74,8 +105,224 @@ bool sonySonyEffectWinsOverDolby(AudioPolicyClientInterface* client) {
+     return false;
+ }
+ 
++// ---------------------------------------------------------------------------
++// Sony HAL parameter worker
++//
++// The policy entry points that read or write Sony HAL state all run with
++// AudioPolicyService_Mutex held. A synchronous getParameters()/setParameters()
++// from there can block the binder thread that timed out (11 号), so queue the
++// HAL traffic onto a managerdefault-local worker instead.
++// ---------------------------------------------------------------------------
++
++enum class SonyTaskType {
++    Write,
++    Refresh,
++    ReassertPlayingPkg,
++};
++
++struct SonyTask {
++    SonyTaskType type;
++    AudioPolicyClientInterface* client = nullptr;
++    String8 params;        // Write
++    std::string key;       // Refresh
++    bool forced = false;   // Refresh
++};
++
++struct SonyWorkerState {
++    std::mutex mutex;
++    std::deque<SonyTask> tasks;
++    // Keys with a Refresh still queued after the most recent Write. Cleared on
++    // every Write so a stale pre-write refresh cannot suppress a post-write one.
++    std::set<std::string> pendingRefresh;
++    bool running = false;
++    bool reassertPending = false;
++    bool havePlayingPkg = false;
++    int playingPkgUid = 0;
++    std::string playingPkgName;
++};
++
++SonyWorkerState gSonyWorker;
++
++void sonyWorkerLoop();
++
++// Must be called with gSonyWorker.mutex held.
++void sonyPushTaskLocked(SonyTask&& task) {
++    gSonyWorker.tasks.push_back(std::move(task));
++    if (!gSonyWorker.running) {
++        gSonyWorker.running = true;
++        std::thread(sonyWorkerLoop).detach();
++    }
++}
++
++// Must be called with gSonyWorker.mutex held.
++void sonyQueueRefreshLocked(AudioPolicyClientInterface* client, const char* key, bool forced) {
++    if (!gSonyWorker.pendingRefresh.insert(key).second) {
++        return;
++    }
++    SonyTask task;
++    task.type = SonyTaskType::Refresh;
++    task.client = client;
++    task.key = key;
++    task.forced = forced;
++    sonyPushTaskLocked(std::move(task));
++}
++
++void sonyRefreshHalParam(AudioPolicyClientInterface* client, const std::string& key, bool forced) {
++    if (client == nullptr) {
++        return;
++    }
++    if (!forced) {
++        String8 unused;
++        bool stale = true;
++        sonyLookupHalCache(key.c_str(), &unused, &stale);
++        if (!stale) {
++            return;  // another refresh or a write-through already updated the entry
++        }
++    }
++    const String8 result = client->getParameters(AUDIO_IO_HANDLE_NONE, String8(key.c_str()));
++    if (result.length() == 0) {
++        ALOGV("%s: %s returned no value", __func__, key.c_str());
++        return;
++    }
++    bool changed = false;
++    {
++        std::lock_guard<std::mutex> lock(gHalCacheMutex);
++        HalCacheEntry& entry = gHalCache[key];
++        changed = entry.value != result;
++        entry.value = result;
++        entry.expireNs = halCacheNowNs() + kHalCacheTtlNs;
++    }
++    if (!changed) {
++        return;
++    }
++    ALOGI("%s: %s -> %s", __func__, key.c_str(), result.c_str());
++    // A HAL value derived from the playing package changed without a policy-side
++    // write to push it. Replay the last playing package so AudioFlinger schedules
++    // one more routing evaluation against the now fresh values.
++    std::lock_guard<std::mutex> lock(gSonyWorker.mutex);
++    if (!gSonyWorker.havePlayingPkg || gSonyWorker.reassertPending) {
++        return;
++    }
++    gSonyWorker.reassertPending = true;
++    SonyTask task;
++    task.type = SonyTaskType::ReassertPlayingPkg;
++    task.client = client;
++    sonyPushTaskLocked(std::move(task));
++}
++
++void sonyWorkerLoop() {
++    for (;;) {
++        SonyTask task;
++        bool havePlayingPkg = false;
++        int playingPkgUid = 0;
++        std::string playingPkgName;
++        {
++            std::lock_guard<std::mutex> lock(gSonyWorker.mutex);
++            if (gSonyWorker.tasks.empty()) {
++                gSonyWorker.running = false;
++                return;
++            }
++            task = std::move(gSonyWorker.tasks.front());
++            gSonyWorker.tasks.pop_front();
++            if (task.type == SonyTaskType::Refresh) {
++                gSonyWorker.pendingRefresh.erase(task.key);
++            } else if (task.type == SonyTaskType::ReassertPlayingPkg) {
++                gSonyWorker.reassertPending = false;
++                havePlayingPkg = gSonyWorker.havePlayingPkg;
++                playingPkgUid = gSonyWorker.playingPkgUid;
++                playingPkgName = gSonyWorker.playingPkgName;
++            }
++        }
++        switch (task.type) {
++        case SonyTaskType::Write:
++            ALOGD("%s: write %s", __func__, task.params.c_str());
++            task.client->setParameters(AUDIO_IO_HANDLE_NONE, task.params, 0);
++            break;
++        case SonyTaskType::Refresh:
++            sonyRefreshHalParam(task.client, task.key, task.forced);
++            break;
++        case SonyTaskType::ReassertPlayingPkg:
++            if (havePlayingPkg) {
++                AudioParameter param;
++                param.addInt(String8("playing_pkg_uid"), playingPkgUid);
++                if (!playingPkgName.empty()) {
++                    param.add(String8("playing_pkg_name"), String8(playingPkgName.c_str()));
++                }
++                ALOGI("%s: reassert playing_pkg uid=%d pkg=%s", __func__, playingPkgUid,
++                      playingPkgName.empty() ? "(unknown)" : playingPkgName.c_str());
++                task.client->setParameters(AUDIO_IO_HANDLE_NONE, param.toString(), 0);
++            }
++            break;
++        }
++    }
++}
++
+ }  // namespace
+ 
++bool sonyGetHalParamCached(AudioPolicyClientInterface* client, const char* key, String8* out) {
++    if (client == nullptr || key == nullptr || out == nullptr) {
++        return false;
++    }
++    bool stale = true;
++    const bool found = sonyLookupHalCache(key, out, &stale);
++    if (!found) {
++        out->clear();
++    }
++    if (stale) {
++        // Stale-while-revalidate: hand the caller the previous value (or a miss)
++        // and refresh off the AudioPolicyService lock.
++        std::lock_guard<std::mutex> lock(gSonyWorker.mutex);
++        sonyQueueRefreshLocked(client, key, false);
++    }
++    return found;
++}
++
++bool sonyGetHalBoolCached(AudioPolicyClientInterface* client, const char* key, bool* out) {
++    String8 result;
++    if (out == nullptr || !sonyGetHalParamCached(client, key, &result) || result.length() == 0) {
++        return false;
++    }
++    return sonyParseHalBool(AudioParameter(result), key, out);
++}
++
++bool sonyGetHalIntCached(AudioPolicyClientInterface* client, const char* key, int* out) {
++    String8 result;
++    if (out == nullptr || !sonyGetHalParamCached(client, key, &result) || result.length() == 0) {
++        return false;
++    }
++    return AudioParameter(result).getInt(String8(key), *out) == NO_ERROR;
++}
++
++void sonyMarkHalCacheStale() {
++    // Keep the previous values: callers may still use them as a stale snapshot
++    // while the worker refreshes, but the next read must revalidate.
++    std::lock_guard<std::mutex> lock(gHalCacheMutex);
++    for (auto& item : gHalCache) {
++        item.second.expireNs = 0;
++    }
++}
++
++void sonyStoreHalCacheValue(const char* key, const String8& value) {
++    std::lock_guard<std::mutex> lock(gHalCacheMutex);
++    HalCacheEntry& entry = gHalCache[key];
++    entry.value = value;
++    entry.expireNs = halCacheNowNs() + kHalCacheTtlNs;
++}
++
++void sonyQueueHalParameterWrite(AudioPolicyClientInterface* client, const String8& keyValuePairs) {
++    if (client == nullptr) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(gSonyWorker.mutex);
++    // Refreshes queued before this write describe the pre-write HAL state.
++    gSonyWorker.pendingRefresh.clear();
++    SonyTask task;
++    task.type = SonyTaskType::Write;
++    task.client = client;
++    task.params = keyValuePairs;
++    sonyPushTaskLocked(std::move(task));
++}
++
+ bool sonyDolbyEnabled(AudioPolicyClientInterface* client) {
+     bool enabled = false;
+     if (sonyGetHalBool(client, "dle_ds_state", &enabled)) {
+@@ -202,7 +449,22 @@ void sonyNotifyPlayingPkgUid(AudioPolicyClientInterface* client, audio_io_handle
+     }
+     ALOGI("%s: uid=%u pkg=%s", __func__, uid,
+           package.empty() ? "(unknown)" : package.c_str());
+-    client->setParameters(AUDIO_IO_HANDLE_NONE, param.toString());
++
++    std::lock_guard<std::mutex> lock(gSonyWorker.mutex);
++    const bool validUid = uid != 0 && uid != static_cast<uid_t>(-1);
++    gSonyWorker.havePlayingPkg = validUid;
++    gSonyWorker.playingPkgUid = validUid ? static_cast<int>(uid) : 0;
++    gSonyWorker.playingPkgName = validUid ? package : std::string();
++    gSonyWorker.pendingRefresh.clear();
++    SonyTask write;
++    write.type = SonyTaskType::Write;
++    write.client = client;
++    write.params = param.toString();
++    sonyPushTaskLocked(std::move(write));
++    // The HAL derives these from playing_pkg; read them back after the write so
++    // the next routing evaluation sees the values for the new package.
++    sonyQueueRefreshLocked(client, "isUpmixSupportedPkg", true);
++    sonyQueueRefreshLocked(client, "is_dsee_prioritized", true);
+ }
+ 
+ bool sonyMusicOutputMatchesRouting(AudioPolicyClientInterface* client,
+diff --git a/services/audiopolicy/managerdefault/SonyDolbyAudioPolicy.h b/services/audiopolicy/managerdefault/SonyDolbyAudioPolicy.h
+index 5244627..4a735e3 100644
+--- a/services/audiopolicy/managerdefault/SonyDolbyAudioPolicy.h
++++ b/services/audiopolicy/managerdefault/SonyDolbyAudioPolicy.h
+@@ -8,11 +8,27 @@
+ #pragma once
+ 
+ #include <system/audio.h>
++#include <utils/String8.h>
+ 
+ namespace android {
+ 
+ class AudioPolicyClientInterface;
+ 
++// Cached HAL reads. AudioPolicyManager asks for Dolby/DSEE/360RA state several
++// times per startOutput() and every read was a synchronous HIDL round trip made
++// while AudioPolicyService_Mutex is held. Reads now return the cached value
++// (possibly stale) and refresh it from the Sony HAL worker.
++bool sonyGetHalParamCached(AudioPolicyClientInterface* client, const char* key, String8* out);
++bool sonyGetHalBoolCached(AudioPolicyClientInterface* client, const char* key, bool* out);
++bool sonyGetHalIntCached(AudioPolicyClientInterface* client, const char* key, int* out);
++// Mark every cached entry stale without dropping its value; the next read
++// returns the old snapshot and queues a refresh.
++void sonyMarkHalCacheStale();
++// Record a value that is known to be current without a HAL round trip.
++void sonyStoreHalCacheValue(const char* key, const String8& value);
++// Queue a parameter write for the Sony HAL worker.
++void sonyQueueHalParameterWrite(AudioPolicyClientInterface* client, const String8& keyValuePairs);
++
+ bool sonyDolbyEnabled(AudioPolicyClientInterface* client);
+ bool sonyDseeHxEnabled(AudioPolicyClientInterface* client);
+ bool sonyDseePrioritized(AudioPolicyClientInterface* client);
+-- 
+2.53.0
+
